@@ -1,0 +1,5 @@
+fastmcp>=2.0.0
+uvicorn>=0.30.0
+requests>=2.31.0
+starlette>=0.37.0
+sse-starlette>=2.1.0
