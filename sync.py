@@ -80,7 +80,6 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
                 execute_batch(cur, insert_sql, batch)
 
 def parse_filer(row):
-    # Combine first and last names if it's an individual candidate
     first = row.get("FIRST_NAME", "").strip()
     last = row.get("LAST_NAME", "").strip()
     full_name = f"{first} {last}".strip() if first else last
@@ -143,7 +142,13 @@ def run_daily_sync():
         return
 
     print("Step 1: Downloading compressed raw data matrix from CA Secretary of State...")
-    response = requests.get(CAL_ACCESS_ZIP_URL, stream=True)
+    
+    # NEW DISGUISE FIX: We add headers so the state's server thinks we are a standard Google Chrome browser
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    response = requests.get(CAL_ACCESS_ZIP_URL, headers=browser_headers, stream=True)
     response.raise_for_status()
     zip_buffer = io.BytesIO(response.content)
     
@@ -151,13 +156,11 @@ def run_daily_sync():
     conn = psycopg2.connect(db_url)
     
     try:
-        # Step 3: Clear yesterday's snapshots completely so we don't duplicate rows
         print("Step 3: Flushing out legacy data rows...")
         with conn.cursor() as cur:
             cur.execute("TRUNCATE TABLE calaccess_receipts, calaccess_expenditures, calaccess_filers CASCADE;")
         conn.commit()
         
-        # Step 4: Parse files inside the zip architecture and process database saves
         print("Step 4: Executing ETL data parsing and structural streaming...")
         with zipfile.ZipFile(zip_buffer) as the_zip:
             
