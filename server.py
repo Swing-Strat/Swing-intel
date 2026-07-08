@@ -2,7 +2,7 @@
 Swing Intel MCP Server
 Swing Strategies — Internal Political Research Tooling
 
-Exposes 10 research tools over Streamable HTTP transport so that
+Exposes 10 research tools over HTTP transport so that
 Claude clients can connect to a single, centrally-hosted instance.
 
 SECURITY NOTE: Every external API key is read from an environment variable
@@ -694,9 +694,10 @@ def execute_ca_finance_custom_sql(sql_query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint — Streamable HTTP transport for Render/Claude Web alignment
+# Entrypoint — Streamable HTTP transport configuration for cloud alignment
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    # Fixed parameter to use standard "http" transport keyword
+    mcp.run(transport="http", host="0.0.0.0", port=port)
