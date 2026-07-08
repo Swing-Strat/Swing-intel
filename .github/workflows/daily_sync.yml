@@ -18,16 +18,23 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip' # Automatically caches packages to speed up future runs
+        cache: 'pip'
 
     - name: Install DB & Sync Dependencies
       run: |
         python -m pip install --upgrade pip
         pip install requests psycopg2-binary
 
+    # NEW STEP: Let the native system download the file directly to disk using Chrome's profile signature
+    - name: Download Raw Zip File to Disk via Curl
+      run: |
+        curl -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+             -L "https://campaignfinance.cdn.sos.ca.gov/rawdata/calaccess_raw_data.zip" \
+             -o state_data_archive.zip
+
     - name: Run ETL Pipeline Stream
       env:
-        # Securely maps your database secret directly into the Python script
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      # We tell Python to process the local file we just downloaded
       run: python sync.py
-      
