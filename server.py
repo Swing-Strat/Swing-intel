@@ -2,26 +2,13 @@
 Swing Intel MCP Server
 Swing Strategies — Internal Political Research Tooling
 
-Exposes 9 research tools over SSE (Server-Sent Events) transport so that
-Claude Desktop clients can connect to a single, centrally-hosted instance
-via a URL rather than each user running a local server.
+Exposes 10 research tools over Streamable HTTP transport so that
+Claude clients can connect to a single, centrally-hosted instance.
 
 SECURITY NOTE: Every external API key is read from an environment variable
 at call time via os.environ.get(). Nothing is hardcoded. If a key is
 missing, the affected tool returns a clear error message rather than
 failing silently or fabricating data.
-
-CHANGELOG:
-- Fixed get_federal_donations(mode="candidate_totals") — endpoint was
-  incorrectly pluralized as /candidates/{id}/totals/. FEC's actual
-  endpoint is singular: /candidate/{id}/totals/. Confirmed against
-  OpenFEC's own documented URL pattern.
-- Expanded search_local_county_finance() jurisdiction coverage from
-  3 jurisdictions (Sacramento, Orange County, Irvine) to 10 major CA
-  cities/regions. See notes on Los Angeles and San Francisco below —
-  both have better authoritative sources (LA Ethics CAMS, SF DataSF
-  SODA API) than generic NetFile/portal search, and are flagged as
-  candidates for dedicated future tools rather than this catch-all.
 """
 
 import os
@@ -31,6 +18,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastmcp import FastMCP
 
 mcp = FastMCP("swing-intel")
@@ -98,6 +87,29 @@ def _safe_post(url: str, json_body: Optional[dict] = None, headers: Optional[dic
                 "raw_text": resp.text[:1000] if resp is not None else None}
 
 
+def _execute_supabase_query(sql: str, params: Optional[tuple] = None) -> dict:
+    """Helper to run a query safely against the Supabase/PostgreSQL instance."""
+    db_url = os.environ.get("SUPABASE_DB_URL")
+    if not db_url:
+        return {"ok": False, "error": "SUPABASE_DB_URL environment variable is missing."}
+    
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            if cur.description:  
+                rows = cur.fetchall()
+                return {"ok": True, "data": rows}
+            conn.commit()
+            return {"ok": True, "data": f"Query executed successfully. Rows affected: {cur.rowcount}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        if conn:
+            conn.close()
+
+
 # ---------------------------------------------------------------------------
 # TOOL 1 — CA State Bills (LegiScan)
 # ---------------------------------------------------------------------------
@@ -113,9 +125,6 @@ def get_ca_state_bills(query: str, mode: str = "search", bill_id: Optional[str] 
               "detail" to get full detail for a known bill_id.
         bill_id: Required when mode="detail". The LegiScan internal bill id
                  (obtained from a prior "search" call).
-
-    Returns a JSON string with bill status, sponsors, and history.
-    Never substitute training data for this — LegiScan status changes daily.
     """
     api_key = os.environ.get("LEGISCAN_API_KEY")
     if not api_key:
@@ -151,7 +160,7 @@ def get_ca_state_bills(query: str, mode: str = "search", bill_id: Optional[str] 
 
 @mcp.tool()
 def get_federal_bills(congress: int, bill_type: str, bill_number: str,
-                       endpoint: str = "detail") -> str:
+                      endpoint: str = "detail") -> str:
     """
     Look up federal legislation via the Congress.gov API.
 
@@ -161,16 +170,13 @@ def get_federal_bills(congress: int, bill_type: str, bill_number: str,
         bill_number: The bill number, e.g. "100".
         endpoint: One of "detail", "actions", "cosponsors", "summaries".
                   Defaults to "detail".
-
-    Returns a JSON string with bill status, sponsor, and (depending on
-    endpoint) actions, cosponsors, or CRS summaries.
     """
     api_key = os.environ.get("CONGRESS_API_KEY")
     if not api_key:
         return _missing_key_error("CONGRESS_API_KEY", "get_federal_bills")
 
     valid_endpoints = {"detail": "", "actions": "/actions",
-                        "cosponsors": "/cosponsors", "summaries": "/summaries"}
+                       "cosponsors": "/cosponsors", "summaries": "/summaries"}
     if endpoint not in valid_endpoints:
         return f"ERROR: endpoint must be one of {list(valid_endpoints.keys())}"
 
@@ -191,7 +197,7 @@ def get_federal_bills(congress: int, bill_type: str, bill_number: str,
 
 @mcp.tool()
 def get_legislator_data(mode: str, name: Optional[str] = None, lat: Optional[float] = None,
-                         lng: Optional[float] = None, chamber: Optional[str] = None) -> str:
+                        lng: Optional[float] = None, chamber: Optional[str] = None) -> str:
     """
     Look up California legislator info via OpenStates.
 
@@ -202,9 +208,6 @@ def get_legislator_data(mode: str, name: Optional[str] = None, lat: Optional[flo
         lng: Longitude — required for mode="by_geo".
         chamber: "upper" or "lower" — required for mode="all_chamber" and
                  optional filter for mode="committees".
-
-    Returns a JSON string with name, party, district, and committee
-    assignments as available.
     """
     api_key = os.environ.get("OPENSTATES_API_KEY")
     if not api_key:
@@ -217,20 +220,20 @@ def get_legislator_data(mode: str, name: Optional[str] = None, lat: Optional[flo
         if not name:
             return "ERROR: mode='by_name' requires a name."
         result = _safe_get(f"{base_url}/people",
-                            params={"jurisdiction": "ca", "name": name},
-                            headers=headers)
+                           params={"jurisdiction": "ca", "name": name},
+                           headers=headers)
     elif mode == "by_geo":
         if lat is None or lng is None:
             return "ERROR: mode='by_geo' requires lat and lng."
         result = _safe_get(f"{base_url}/people.geo",
-                            params={"lat": lat, "lng": lng},
-                            headers=headers)
+                           params={"lat": lat, "lng": lng},
+                           headers=headers)
     elif mode == "all_chamber":
         if chamber not in ("upper", "lower"):
             return "ERROR: mode='all_chamber' requires chamber='upper' or 'lower'."
         result = _safe_get(f"{base_url}/people",
-                            params={"jurisdiction": "ca", "chamber": chamber},
-                            headers=headers)
+                           params={"jurisdiction": "ca", "chamber": chamber},
+                           headers=headers)
     elif mode == "committees":
         params = {"jurisdiction": "ca"}
         if chamber:
@@ -251,9 +254,9 @@ def get_legislator_data(mode: str, name: Optional[str] = None, lat: Optional[flo
 
 @mcp.tool()
 def get_federal_donations(mode: str, name: Optional[str] = None,
-                           candidate_id: Optional[str] = None,
-                           committee_id: Optional[str] = None,
-                           cycle: Optional[int] = None) -> str:
+                          candidate_id: Optional[str] = None,
+                          committee_id: Optional[str] = None,
+                          cycle: Optional[int] = None) -> str:
     """
     Look up federal campaign finance data via the FEC API.
 
@@ -266,9 +269,6 @@ def get_federal_donations(mode: str, name: Optional[str] = None,
         committee_id: FEC committee id — required for committee_totals and
                       top_donors.
         cycle: Election cycle year, e.g. 2026 — required for the *_totals modes.
-
-    Returns a JSON string. Always check 'coverage_end_date' in results —
-    FEC filings lag actual contributions by weeks.
     """
     api_key = os.environ.get("FEC_API_KEY")
     if not api_key:
@@ -281,36 +281,33 @@ def get_federal_donations(mode: str, name: Optional[str] = None,
         if not name:
             return "ERROR: mode='search_candidate' requires name."
         result = _safe_get(f"{base_url}/candidates/search/",
-                            params={**params_common, "q": name, "state": "CA", "per_page": 10})
+                           params={**params_common, "q": name, "state": "CA", "per_page": 10})
     elif mode == "candidate_totals":
         if not candidate_id or not cycle:
             return "ERROR: mode='candidate_totals' requires candidate_id and cycle."
-        # FIX: this endpoint is singular ("candidate", not "candidates").
-        # Confirmed against OpenFEC's documented URL pattern:
-        # https://api.open.fec.gov/v1/candidate/{candidate_id}/totals/
         result = _safe_get(f"{base_url}/candidate/{candidate_id}/totals/",
-                            params={**params_common, "cycle": cycle})
+                           params={**params_common, "cycle": cycle})
     elif mode == "search_committee":
         if not name:
             return "ERROR: mode='search_committee' requires name."
         result = _safe_get(f"{base_url}/committees/",
-                            params={**params_common, "q": name, "state": "CA", "per_page": 10})
+                           params={**params_common, "q": name, "state": "CA", "per_page": 10})
     elif mode == "committee_totals":
         if not committee_id or not cycle:
             return "ERROR: mode='committee_totals' requires committee_id and cycle."
         result = _safe_get(f"{base_url}/committee/{committee_id}/totals/",
-                            params={**params_common, "cycle": cycle})
+                           params={**params_common, "cycle": cycle})
     elif mode == "top_donors":
         if not committee_id:
             return "ERROR: mode='top_donors' requires committee_id."
         result = _safe_get(f"{base_url}/schedules/schedule_a/",
-                            params={**params_common, "committee_id": committee_id,
-                                    "sort": "-contribution_receipt_amount", "per_page": 10})
+                           params={**params_common, "committee_id": committee_id,
+                                   "sort": "-contribution_receipt_amount", "per_page": 10})
     elif mode == "independent_expenditures":
         if not candidate_id:
             return "ERROR: mode='independent_expenditures' requires candidate_id."
         result = _safe_get(f"{base_url}/schedules/schedule_e/",
-                            params={**params_common, "candidate_id": candidate_id, "per_page": 20})
+                           params={**params_common, "candidate_id": candidate_id, "per_page": 20})
     else:
         return ("ERROR: mode must be one of 'search_candidate', 'candidate_totals', "
                 "'search_committee', 'committee_totals', 'top_donors', "
@@ -323,185 +320,95 @@ def get_federal_donations(mode: str, name: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
-# TOOL 5 — CA State Campaign Finance (FollowTheMoney)
+# TOOL 5 — CA State Campaign Finance (Supabase Integration)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def search_ca_state_finance(mode: str, filer_name: Optional[str] = None,
-                             donor_name: Optional[str] = None,
-                             year: Optional[int] = None) -> str:
+def query_ca_state_finance(mode: str, name_query: Optional[str] = None, filer_id: Optional[str] = None) -> str:
     """
-    Look up California state-level campaign finance via FollowTheMoney.
+    Query structured California state campaign finance disclosures directly 
+    from the Swing Strategies internal Supabase data warehouse.
 
     Args:
-        mode: One of "by_filer" (candidate/committee cash totals and IEs)
-              or "by_donor" (contributions from a specific donor).
-        filer_name: Candidate, committee, or ballot measure committee name —
-                    required for mode="by_filer".
-        donor_name: Donor name — required for mode="by_donor".
-        year: Election year, e.g. 2026. Defaults to the current year if omitted.
-
-    Returns a JSON string. Always supplement with CAL-ACCESS
-    (https://cal-access.sos.ca.gov/) for the most current filings, since
-    FollowTheMoney data can lag official state filings.
-
-    NOTE: This tool queries the FollowTheMoney API. It does not query
-    OpenSecrets, which covers federal — not California state — money and
-    requires a separate key/registration.
+        mode: One of "search_filer" (fuzzy matches candidate/PAC names to find IDs)
+              or "filer_overview" (pulls full metrics summary for a specific filer ID).
+        name_query: Name snippet of the candidate or committee. (Required for mode="search_filer").
+        filer_id: The official 7-digit state filer ID string. (Required for mode="filer_overview").
     """
-    api_key = os.environ.get("FOLLOWTHEMONEY_API_KEY")
-    if not api_key:
-        return _missing_key_error("FOLLOWTHEMONEY_API_KEY", "search_ca_state_finance")
-
-    if not year:
-        year = datetime.now().year
-
-    base_url = "https://api.followthemoney.org/"
-    params = {
-        "APIKey": api_key,
-        "dt": 1,
-        "f-fc": "1,2,3",
-        "mode": "json",
-        "s": "CA",
-        "y": year,
-    }
-
-    if mode == "by_filer":
-        if not filer_name:
-            return "ERROR: mode='by_filer' requires filer_name."
-        params["f-filer"] = filer_name
-    elif mode == "by_donor":
-        if not donor_name:
-            return "ERROR: mode='by_donor' requires donor_name."
-        params["f-donor"] = donor_name
+    if mode == "search_filer":
+        if not name_query:
+            return "ERROR: mode='search_filer' requires a 'name_query' parameter."
+        
+        sql = """
+            SELECT filer_id, filer_type, filer_name, filer_status 
+            FROM calaccess_filers 
+            WHERE filer_name ILIKE %s 
+            ORDER BY filer_name LIMIT 10;
+        """
+        result = _execute_supabase_query(sql, (f"%{name_query}%",))
+        
+    elif mode == "filer_overview":
+        if not filer_id:
+            return "ERROR: mode='filer_overview' requires a valid 'filer_id'."
+            
+        output = {"filer_info": {}, "receipts_summary": {}, "expenditures_summary": {}}
+        
+        info_res = _execute_supabase_query("SELECT * FROM calaccess_filers WHERE filer_id = %s;", (filer_id,))
+        if info_res["ok"] and info_res["data"]:
+            output["filer_info"] = info_res["data"][0]
+            
+        rcpt_res = _execute_supabase_query("""
+            SELECT COALESCE(SUM(amount), 0) as total_raised, COUNT(*) as donation_count,
+                   COALESCE(MAX(amount), 0) as largest_single_donation
+            FROM calaccess_receipts WHERE filer_id = %s;
+        """, (filer_id,))
+        if rcpt_res["ok"] and rcpt_res["data"]:
+            output["receipts_summary"] = rcpt_res["data"][0]
+            
+        expn_res = _execute_supabase_query("""
+            SELECT COALESCE(SUM(amount), 0) as total_spent, COUNT(*) as expense_count
+            FROM calaccess_expenditures WHERE filer_id = %s;
+        """, (filer_id,))
+        if expn_res["ok"] and expn_res["data"]:
+            output["expenditures_summary"] = expn_res["data"][0]
+            
+        return json.dumps(output, indent=2)
+        
     else:
-        return "ERROR: mode must be 'by_filer' or 'by_donor'."
-
-    result = _safe_get(base_url, params=params)
+        return "ERROR: mode must be 'search_filer' or 'filer_overview'."
 
     if not result["ok"]:
-        return f"FollowTheMoney lookup failed: {result['error']}"
-
+        return f"Supabase Warehouse Query Failed: {result['error']}"
+        
     return json.dumps(result["data"], indent=2)
 
 
 # ---------------------------------------------------------------------------
 # TOOL 6 — Local City/County Campaign Finance (Exa search over public portals)
 # ---------------------------------------------------------------------------
-#
-# COVERAGE NOTES:
-#
-# - This tool is a search-lead generator, not a structured data API. Every
-#   jurisdiction below ultimately runs on NetFile, a legacy county/city
-#   clerk portal, or a jurisdiction-specific site — none expose usable
-#   JSON. Treat every result as something a human must verify on the
-#   actual portal before it's used in any output.
-#
-# - The `site:` filters below are best-effort domain patterns based on how
-#   each jurisdiction's portal is typically structured, NOT independently
-#   verified for every jurisdiction. If a jurisdiction returns weak or no
-#   results, check the manual_portals URL directly and consider updating
-#   the site filter — do not assume zero results means zero activity.
-#
-# - Los Angeles: The authoritative source for LA city/county races is the
-#   LA Ethics Commission's CAMS system, not NetFile. CAMS has no public
-#   API (confirmed limitation — see project notes). This tool's LA entry
-#   is a fallback web-search lead generator only; it does NOT query CAMS.
-#   A dedicated CAMS-aware tool is a candidate for future work, but CAMS's
-#   lack of an API means that would likely also be search/scrape-based
-#   rather than a clean structured integration.
-#
-# - San Francisco: SF has a real, documented open-data API — DataSF's SODA
-#   endpoint — which is a better long-term fit than generic search leads
-#   for SF races. This tool's SF entry is a search-lead fallback only, not
-#   a DataSF integration. A dedicated SF tool built on the SODA API is a
-#   good candidate for a future, higher-fidelity addition.
-#
-# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def search_local_county_finance(candidate_or_committee_name: str,
-                                 jurisdiction: str = "sacramento") -> str:
+                                jurisdiction: str = "sacramento") -> str:
     """
     Search for local city/county campaign finance disclosures (Form 460s and
     equivalent) via targeted web search over known public portals.
-
-    IMPORTANT KNOWN LIMITATION: This tool does not call a structured API for
-    any jurisdiction. NetFile's own API does not return usable JSON — it
-    redirects to its front-end portal — and most other local portals below
-    have no public API at all. Instead this tool runs a scoped web search
-    (via Exa) restricted to known public disclosure portal domains and
-    returns links/snippets for a human or downstream Claude call to review.
-    Treat every result as a lead to verify manually on the portal, not as
-    structured, machine-parsed filing data.
-
-    Los Angeles and San Francisco have better authoritative sources (LA
-    Ethics CAMS and SF DataSF's SODA API respectively) than this tool's
-    generic search-lead approach — see the module-level notes above this
-    function. Use this tool for LA/SF only as a starting point, and always
-    surface the manual_verification_url for those two jurisdictions.
-
-    Args:
-        candidate_or_committee_name: The candidate, committee, or measure name.
-        jurisdiction: One of "sacramento", "orange_county", "irvine",
-                      "los_angeles", "san_francisco", "san_diego", "san_jose",
-                      "long_beach", "oakland", "fresno", "bakersfield", "other".
-                      Determines which portal domains are prioritized.
-
-    Returns a JSON string of search results (title, url, snippet) plus the
-    manual-lookup portal URL for the chosen jurisdiction.
     """
     api_key = os.environ.get("EXA_API_KEY")
 
     portal_map = {
-        "sacramento": [
-            "site:pubdocs.saccounty.gov",
-            "site:elections.saccounty.gov",
-            "site:netfile.com/public/Sacramento",
-        ],
-        "orange_county": [
-            "site:ocvote.gov",
-            "site:netfile.com/public/OrangeCounty",
-        ],
-        "irvine": [
-            "site:cityofirvine.org",
-            "site:netfile.com/public/Irvine",
-        ],
-        "los_angeles": [
-            "site:ethics.lacity.org",
-            "site:lacity.org",
-        ],
-        "san_francisco": [
-            "site:sfethics.org",
-            "site:data.sfgov.org",
-        ],
-        "san_diego": [
-            "site:sandiego.gov",
-            "site:netfile.com/public/SanDiego",
-        ],
-        "san_jose": [
-            "site:sanjoseca.gov",
-            "site:netfile.com/public/SanJose",
-        ],
-        "long_beach": [
-            "site:longbeach.gov",
-            "site:netfile.com/public/LongBeach",
-        ],
-        "oakland": [
-            "site:oaklandca.gov",
-            "site:netfile.com/public/Oakland",
-        ],
-        "fresno": [
-            "site:fresno.gov",
-            "site:netfile.com/public/Fresno",
-        ],
-        "bakersfield": [
-            "site:bakersfieldcity.us",
-            "site:netfile.com/public/Bakersfield",
-        ],
-        "other": [
-            "site:netfile.com/public",
-        ],
+        "sacramento": ["site:pubdocs.saccounty.gov", "site:elections.saccounty.gov", "site:netfile.com/public/Sacramento"],
+        "orange_county": ["site:ocvote.gov", "site:netfile.com/public/OrangeCounty"],
+        "irvine": ["site:cityofirvine.org", "site:netfile.com/public/Irvine"],
+        "los_angeles": ["site:ethics.lacity.org", "site:lacity.org"],
+        "san_francisco": ["site:sfethics.org", "site:data.sfgov.org"],
+        "san_diego": ["site:sandiego.gov", "site:netfile.com/public/SanDiego"],
+        "san_jose": ["site:sanjoseca.gov", "site:netfile.com/public/SanJose"],
+        "long_beach": ["site:longbeach.gov", "site:netfile.com/public/LongBeach"],
+        "oakland": ["site:oaklandca.gov", "site:netfile.com/public/Oakland"],
+        "fresno": ["site:fresno.gov", "site:netfile.com/public/Fresno"],
+        "bakersfield": ["site:bakersfieldcity.us", "site:netfile.com/public/Bakersfield"],
+        "other": ["site:netfile.com/public"],
     }
 
     manual_portals = {
@@ -552,10 +459,7 @@ def search_local_county_finance(candidate_or_committee_name: str,
         "manual_verification_url": manual_portals[jurisdiction],
         "note": ("These are search leads, not parsed filing data. Most local "
                  "portals (NetFile and otherwise) have no usable public API. "
-                 "Verify every figure directly on the portal before using it. "
-                 "For Los Angeles, the authoritative source is LA Ethics CAMS; "
-                 "for San Francisco, consider SF DataSF's SODA API for a more "
-                 "structured lookup than this generic search."),
+                 "Verify every figure directly on the portal before using it."),
     }
     return json.dumps(output, indent=2)
 
@@ -566,21 +470,10 @@ def search_local_county_finance(candidate_or_committee_name: str,
 
 @mcp.tool()
 def get_economic_data(series_id: str, start_year: Optional[int] = None,
-                       end_year: Optional[int] = None) -> str:
+                      end_year: Optional[int] = None) -> str:
     """
     Pull regional employment/unemployment data from the Bureau of Labor
     Statistics (BLS) Local Area Unemployment Statistics (LAUS) API.
-
-    Args:
-        series_id: BLS series ID, e.g. "LAUCN060670000000003" for Sacramento
-                   County unemployment rate, or "LASST060000000000003" for
-                   statewide California, or "LNS14000000" for national.
-        start_year: First year of data to pull. Defaults to two years ago.
-        end_year: Last year of data to pull. Defaults to the current year.
-
-    Returns a JSON string with the time series data. BLS LAUS county data
-    typically runs 3-5 weeks behind — always check the 'latest' flag and
-    footnote codes for preliminary ("P") data.
     """
     api_key = os.environ.get("BLS_API_KEY")
     if not api_key:
@@ -617,18 +510,6 @@ def get_news_and_policy(query: str, days_back: int = 30, num_results: int = 10) 
     """
     Run a semantic web search for local press coverage, public affairs
     articles, and policy whitepapers via the Exa API.
-
-    Args:
-        query: The topic, measure, or keyword to search for. Be specific —
-               e.g. "Sacramento rent control ballot measure 2026" rather
-               than just "rent control".
-        days_back: How many days back to search. Defaults to 30.
-        num_results: How many results to return. Defaults to 10, max 25.
-
-    Returns a JSON string of results with title, url, published date, and
-    a short excerpt for each. Always attribute claims to the specific
-    outlet and date — do not present search excerpts as verified fact
-    without noting the source.
     """
     api_key = os.environ.get("EXA_API_KEY")
     if not api_key:
@@ -721,19 +602,7 @@ must carry:
 @mcp.tool()
 def fppc_guideline_lookup(topic: Optional[str] = None) -> str:
     """
-    Return California FPPC compliance guidance for cross-referencing during
-    a chat. This is a local, static reference — it does not call an
-    external API and does not reflect same-day changes to FPPC regulations.
-
-    Args:
-        topic: Optional filter — one of "contribution_limits",
-               "ballot_measures", "disclosure", "independent_expenditures",
-               "ab2355", "expenditure_ceilings". If omitted, returns the
-               full reference document.
-
-    Always tell the user this is a preliminary check and that current
-    figures must be verified at fppc.ca.gov before use in any filed or
-    client-facing document.
+    Return California FPPC compliance guidance for cross-referencing during a chat.
     """
     topic_map = {
         "contribution_limits": "## Contribution Limits (State Candidates)",
@@ -748,8 +617,7 @@ def fppc_guideline_lookup(topic: Optional[str] = None) -> str:
         return FPPC_GUIDELINES_MD
 
     if topic not in topic_map:
-        return (f"ERROR: topic must be one of {list(topic_map.keys())} or omitted "
-                f"for the full reference.")
+        return f"ERROR: topic must be one of {list(topic_map.keys())}"
 
     header = topic_map[topic]
     sections = FPPC_GUIDELINES_MD.split("## ")
@@ -757,13 +625,78 @@ def fppc_guideline_lookup(topic: Optional[str] = None) -> str:
         if section.startswith(header.replace("## ", "")):
             return "## " + section
 
-    return FPPC_GUIDELINES_MD  # fallback, should not normally hit
+    return FPPC_GUIDELINES_MD  
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint — SSE transport over HTTP for remote/cloud hosting
+# TOOL 10 — Advanced AI SQL Engine (Dynamic Reads)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def execute_ca_finance_custom_sql(sql_query: str) -> str:
+    """
+    Execute a raw, read-only PostgreSQL SELECT query against the California 
+    Campaign Finance data warehouse schemas. Use this when custom filters, 
+    groupings, or deep table joins are required.
+
+    AVAILABLE WAREHOUSE TABLES:
+    
+    1. calaccess_filers:
+       - filer_id VARCHAR(15) PRIMARY KEY
+       - filer_type VARCHAR(50)
+       - filer_name TEXT NOT NULL
+       - filer_status VARCHAR(20)
+       - first_name / last_name VARCHAR(255)
+
+    2. calaccess_receipts (Contributions IN):
+       - id BIGSERIAL PRIMARY KEY
+       - filing_id INT
+       - filer_id VARCHAR(15) REFERENCES calaccess_filers(filer_id)
+       - amount NUMERIC(12,2)
+       - receipt_date DATE
+       - contributor_type VARCHAR(10)
+       - contributor_last_name TEXT 
+       - contributor_first_name VARCHAR(255)
+       - contributor_city / contributor_state / contributor_zip
+       - contributor_employer / contributor_occupation 
+       - cumulative_ytd NUMERIC(12,2)
+
+    3. calaccess_expenditures (Outbound Vendor/Staff Spend):
+       - id BIGSERIAL PRIMARY KEY
+       - filing_id INT
+       - filer_id VARCHAR(15) REFERENCES calaccess_filers(filer_id)
+       - amount NUMERIC(12,2)
+       - expenditure_date DATE
+       - payee_last_name TEXT 
+       - payee_first_name VARCHAR(255)
+       - payee_city / payee_state / payee_zip
+       - expenditure_code VARCHAR(3) 
+       - expenditure_description TEXT
+       - candidate_name / ballot_measure_name 
+       - support_oppose_code VARCHAR(1) 
+
+    CRITICAL RULES:
+    - Only SELECT queries are permitted. Mutation queries will be immediately blocked.
+    - Always apply a LIMIT statement (max 100 rows) to protect context windows.
+    """
+    clean_query = sql_query.strip().lower()
+    forbidden_commands = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "replace"]
+    
+    if any(cmd in clean_query for cmd in forbidden_commands) or not clean_query.startswith(("select", "with")):
+        return "ERROR: Safety violation. This endpoint only executes read-only SELECT database actions."
+
+    result = _execute_supabase_query(sql_query)
+    
+    if not result["ok"]:
+        return f"Database Error: {result['error']}"
+        
+    return json.dumps(result["data"], indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint — Streamable HTTP transport for Render/Claude Web alignment
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
