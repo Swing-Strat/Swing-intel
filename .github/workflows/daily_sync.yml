@@ -2,9 +2,9 @@ name: Daily Supabase Sync
 
 on:
   schedule:
-    # Triggers every single morning at 12:00 UTC (4:00 AM PST / 5:00 AM PDT)
+    # Triggers every single morning at 12:00 UTC (4:00 AM PST)
     - cron: '0 12 * * *'
-  workflow_dispatch: # Allows you to manually click a button in GitHub to trigger a sync anytime
+  workflow_dispatch: # Allows manual one-click testing inside GitHub anytime
 
 jobs:
   sync-data:
@@ -20,22 +20,25 @@ jobs:
         python-version: '3.11'
         cache: 'pip'
 
+    # We add 'bln' to the installation list to use Stanford's official python package
     - name: Install DB & Sync Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests psycopg2-binary
+        pip install requests psycopg2-binary bln
 
-    # FIXED: We changed the headers to match a silent binary download instead of a webpage request
-    - name: Download Raw Zip File to Disk via Curl
+    # Stanford's infrastructure lets cloud runners right through the front door
+    - name: Download Raw Zip File via Big Local News Mirror
+      env:
+        BLN_API_KEY: ${{ secrets.BLN_API_KEY }}
       run: |
         curl -Ssl --fail \
-             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" \
-             -H "Accept: application/zip,application/octet-stream,*/*" \
-             -H "Connection: keep-alive" \
-             -L "https://campaignfinance.cdn.sos.ca.gov/rawdata/calaccess_raw_data.zip" \
+             -H "Authorization: Token ${BLN_API_KEY}" \
+             -L "https://calaccess.californiacivicdata.org/downloads/latest/clean/calaccess_raw_data.zip" \
              -o state_data_archive.zip
+        # Note: If your project token targets a specific BLN Project ID asset directory, 
+        # the official "bln" tool can also pull it via command-line dynamically.
 
-    - name: Run ETL Pipeline Stream
+    - name: Run ETL Pipeline Stream to Supabase
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       run: python sync.py
