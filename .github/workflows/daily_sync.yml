@@ -4,7 +4,7 @@ on:
   schedule:
     # Triggers every single morning at 12:00 UTC (4:00 AM PST)
     - cron: '0 12 * * *'
-  workflow_dispatch: # Allows you to manually click a button in GitHub to trigger a sync anytime
+  workflow_dispatch: # Allows manual one-click testing inside GitHub anytime
 
 jobs:
   sync-data:
@@ -25,14 +25,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests psycopg2-binary
 
-    # FIXED: Using the stable open cloud mirror that accepts datacenter connections
-    - name: Download Raw Zip File to Disk via Civic Data Mirror
-      run: |
-        curl -Ssl --fail \
-             -L "https://calaccess.download/latest/raw.zip" \
-             -o state_data_archive.zip
-
-    - name: Run ETL Pipeline Stream
+    - name: Run Integrated Download and Sync Pipeline
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        BLN_API_KEY: ${{ secrets.BLN_API_KEY }}
+      # Python now handles the secure Stanford download and the database ingestion completely
       run: python sync.py
