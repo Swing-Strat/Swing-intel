@@ -4,7 +4,7 @@ on:
   schedule:
     # Triggers every single morning at 12:00 UTC (4:00 AM PST)
     - cron: '0 12 * * *'
-  workflow_dispatch: # Allows manual one-click testing inside GitHub anytime
+  workflow_dispatch: # Allows you to manually click a button in GitHub to trigger a sync anytime
 
 jobs:
   sync-data:
@@ -20,25 +20,19 @@ jobs:
         python-version: '3.11'
         cache: 'pip'
 
-    # We add 'bln' to the installation list to use Stanford's official python package
     - name: Install DB & Sync Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests psycopg2-binary bln
+        pip install requests psycopg2-binary
 
-    # Stanford's infrastructure lets cloud runners right through the front door
-    - name: Download Raw Zip File via Big Local News Mirror
-      env:
-        BLN_API_KEY: ${{ secrets.BLN_API_KEY }}
+    # FIXED: Using the stable open cloud mirror that accepts datacenter connections
+    - name: Download Raw Zip File to Disk via Civic Data Mirror
       run: |
         curl -Ssl --fail \
-             -H "Authorization: Token ${BLN_API_KEY}" \
-             -L "https://calaccess.californiacivicdata.org/downloads/latest/clean/calaccess_raw_data.zip" \
+             -L "https://calaccess.download/latest/raw.zip" \
              -o state_data_archive.zip
-        # Note: If your project token targets a specific BLN Project ID asset directory, 
-        # the official "bln" tool can also pull it via command-line dynamically.
 
-    - name: Run ETL Pipeline Stream to Supabase
+    - name: Run ETL Pipeline Stream
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       run: python sync.py
