@@ -2,16 +2,10 @@ import os
 import csv
 import zipfile
 import io
+import requests
 import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime
-
-# Target mapping: State File Name -> Our Supabase Table
-TARGET_FILES = {
-    "Filername_CD.tsv": "calaccess_filers",
-    "Rcpt_CD.tsv": "calaccess_receipts",
-    "Expn_CD.tsv": "calaccess_expenditures"
-}
 
 def safe_float(val):
     if not val or val.strip() == "":
@@ -40,6 +34,89 @@ def safe_date(val):
             continue
     return None
 
+def download_from_big_local_news():
+    """Connects to Stanford's API, dynamically finds the CalAccess project, and downloads the archive."""
+    token = os.environ.get("BLN_API_KEY")
+    local_filename = "state_data_archive.zip"
+    
+    if not token:
+        print("ℹ️ BLN_API_KEY variable not found. Assuming local testing; searching for local zip asset...")
+        return local_filename
+
+    print("Step 1: Connecting to Stanford's Big Local News API platform...")
+    headers = {"Authorization": f"Token {token}"}
+    
+    # Check alternate Stanford REST API endpoint nodes
+    endpoints = ["https://api.biglocalnews.org/projects/", "https://api.biglocalnews.org/api/v1/projects/"]
+    projects = []
+    
+    for url in endpoints:
+        try:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                projects = data.get("results", data) if isinstance(data, dict) else data
+                break
+        except Exception:
+            continue
+
+    if not projects or not isinstance(projects, list):
+        print("⚠️ Warning: Could not authenticate or parse project matrix from BLN. Checking for local zip...")
+        return local_filename
+
+    # Scan project catalog for the matching California Campaign dataset
+    target_project = None
+    for p in projects:
+        name = p.get("name", "").lower()
+        if "california" in name and "campaign" in name:
+            target_project = p
+            break
+
+    if not target_project:
+        print("⚠️ Warning: 'California campaign finance data' project directory not found in this BLN profile.")
+        return local_filename
+
+    project_id = target_project.get("id")
+    print(f"📂 Found Linked Stanford Project Asset: {target_project.get('name')} (ID: {project_id})")
+
+    # Fetch file asset manifest
+    files_url = f"https://api.biglocalnews.org/projects/{project_id}/files/"
+    res = requests.get(files_url, headers=headers, timeout=15)
+    if res.status_code != 200:
+        res = requests.get(f"https://api.biglocalnews.org/api/v1/projects/{project_id}/files/", headers=headers, timeout=15)
+    
+    if res.status_code != 200:
+        print("⚠️ Warning: Access denied reading project asset map from Stanford catalog.")
+        return local_filename
+
+    file_data = res.json()
+    files = file_data.get("results", file_data) if isinstance(file_data, dict) else file_data
+
+    # Locate the target compressed data matrix zip file
+    target_file = None
+    for f in files:
+        fname = f.get("name", "")
+        if fname.endswith(".zip") or "raw" in fname.lower():
+            target_file = f
+            break
+
+    if not target_file:
+        print("⚠️ Warning: Could not locate a valid raw processing data .zip package inside the project.")
+        return local_filename
+
+    file_id = target_file.get("id") or target_file.get("name")
+    download_url = f"https://api.biglocalnews.org/projects/{project_id}/files/{file_id}/download/"
+    
+    print(f"📥 Downloading latest daily clean data mirror directly from Stanford cluster...")
+    with requests.get(download_url, headers=headers, stream=True, timeout=90) as r:
+        r.raise_for_status()
+        with open(local_filename, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 64):
+                f.write(chunk)
+                
+    print("✅ Transfer complete! File cleanly cached onto automated workflow workspace.")
+    return local_filename
+
 def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, conn):
     target_filename = None
     for f in the_zip.namelist():
@@ -48,10 +125,10 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
             break
             
     if not target_filename:
-        print(f"⚠️ Warning: Could not locate a file matching '{filename_keyword}' in the zip package.")
+        print(f"⚠️ Warning: File snippet matching '{filename_keyword}' was absent inside the archive.")
         return
 
-    print(f"Processing and cleaning entries from state file: {target_filename}...")
+    print(f"Processing and parsing record columns from internal sheet: {target_filename}...")
     
     with the_zip.open(target_filename) as raw_file:
         text_file = io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore')
@@ -94,25 +171,26 @@ def parse_expenditure(row):
 def run_daily_sync():
     db_url = os.environ.get("SUPABASE_DB_URL")
     if not db_url:
-        print("Delta Abort: SUPABASE_DB_URL is missing.")
+        print("❌ Core Abort: SUPABASE_DB_URL target path missing.")
         return
 
-    # FIXED: We look directly on the hard drive for the file downloaded by the workflow
-    local_zip_path = "state_data_archive.zip"
+    # Call the new adaptive Stanford downloader engine
+    local_zip_path = download_from_big_local_news()
+    
     if not os.path.exists(local_zip_path):
-        print(f"❌ Error: Could not find the local file '{local_zip_path}' on disk.")
+        print(f"❌ Abort: Local staging archive cache file '{local_zip_path}' could not be resolved.")
         return
 
-    print("Step 1: Successfully detected local data file archive. Connecting to Supabase...")
+    print("Step 2: Connecting directly to your cloud Supabase Warehouse cluster...")
     conn = psycopg2.connect(db_url)
     
     try:
-        print("Step 2: Flushing out legacy data rows...")
+        print("Step 3: Flushing legacy tables via TRUNCATE CASCADE...")
         with conn.cursor() as cur:
             cur.execute("TRUNCATE TABLE calaccess_receipts, calaccess_expenditures, calaccess_filers CASCADE;")
         conn.commit()
         
-        print("Step 3: Opening archive and processing ETL updates...")
+        print("Step 4: Extracting zip architecture streams and loading database chunks...")
         with zipfile.ZipFile(local_zip_path) as the_zip:
             
             # Load Filers
@@ -149,11 +227,11 @@ def run_daily_sync():
             )
             
         conn.commit()
-        print("🎯 Success! Your Swing Strategies Data Warehouse is completely populated and up to date.")
+        print("\n🎯 Success! The data pipeline completely refreshed your Swing Strategies Warehouse tables.")
         
     except Exception as e:
         conn.rollback()
-        print(f"❌ Pipeline Failure: {str(e)}")
+        print(f"❌ Data Extraction Pipeline Failure: {str(e)}")
         raise e
     finally:
         conn.close()
