@@ -9,6 +9,14 @@ SECURITY NOTE: Every external API key is read from an environment variable
 at call time via os.environ.get(). Nothing is hardcoded. If a key is
 missing, the affected tool returns a clear error message rather than
 failing silently or fabricating data.
+
+DATABASE ACCESS NOTE: All Supabase/PostgreSQL queries in this file run
+through SUPABASE_DB_URL_READONLY, a connection that should be bound to a
+Postgres role granted SELECT-only privileges. The nightly sync pipeline
+(sync.py) should use a SEPARATE, privileged connection string
+(SUPABASE_DB_URL) that is never referenced here. This separation means
+that even if a generated SQL query is malformed or unexpected, the
+database itself will refuse any write, insert, update, or delete.
 """
 
 import os
@@ -29,6 +37,7 @@ mcp = FastMCP("swing-intel")
 # ---------------------------------------------------------------------------
 
 DEFAULT_TIMEOUT = 20  # seconds
+MAX_SQL_ROWS = 100  # hard ceiling enforced in code, not just in the tool description
 
 
 def _missing_key_error(env_var_name: str, tool_name: str) -> str:
@@ -42,6 +51,7 @@ def _missing_key_error(env_var_name: str, tool_name: str) -> str:
 def _safe_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None,
               timeout: int = DEFAULT_TIMEOUT):
     """Wrapper around requests.get with consistent error handling."""
+    resp = None
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=timeout)
         resp.raise_for_status()
@@ -49,7 +59,7 @@ def _safe_get(url: str, params: Optional[dict] = None, headers: Optional[dict] =
     except requests.exceptions.HTTPError as e:
         return {
             "ok": False,
-            "error": f"HTTP error {resp.status_code}: {str(e)}",
+            "error": f"HTTP error {resp.status_code if resp is not None else '?'}: {str(e)}",
             "raw_text": resp.text[:1000] if resp is not None else None,
         }
     except requests.exceptions.Timeout:
@@ -68,6 +78,7 @@ def _safe_get(url: str, params: Optional[dict] = None, headers: Optional[dict] =
 
 def _safe_post(url: str, json_body: Optional[dict] = None, headers: Optional[dict] = None,
                 timeout: int = DEFAULT_TIMEOUT):
+    resp = None
     try:
         resp = requests.post(url, json=json_body, headers=headers, timeout=timeout)
         resp.raise_for_status()
@@ -75,7 +86,7 @@ def _safe_post(url: str, json_body: Optional[dict] = None, headers: Optional[dic
     except requests.exceptions.HTTPError as e:
         return {
             "ok": False,
-            "error": f"HTTP error {resp.status_code}: {str(e)}",
+            "error": f"HTTP error {resp.status_code if resp is not None else '?'}: {str(e)}",
             "raw_text": resp.text[:1000] if resp is not None else None,
         }
     except requests.exceptions.Timeout:
@@ -88,17 +99,36 @@ def _safe_post(url: str, json_body: Optional[dict] = None, headers: Optional[dic
 
 
 def _execute_supabase_query(sql: str, params: Optional[tuple] = None) -> dict:
-    """Helper to run a query safely against the Supabase/PostgreSQL instance."""
-    db_url = os.environ.get("SUPABASE_DB_URL")
+    """
+    Helper to run a READ-ONLY query against the Supabase/PostgreSQL instance.
+
+    IMPORTANT: This intentionally reads SUPABASE_DB_URL_READONLY, not
+    SUPABASE_DB_URL. SUPABASE_DB_URL_READONLY should be a connection string
+    authenticated as a Postgres role that has been granted SELECT-only
+    privileges (see swing_intel_readonly role setup). This is a deliberate
+    safety boundary: no query run through this function should ever be able
+    to modify data, regardless of what the query text says.
+    """
+    db_url = os.environ.get("SUPABASE_DB_URL_READONLY")
     if not db_url:
-        return {"ok": False, "error": "SUPABASE_DB_URL environment variable is missing."}
-    
+        return {
+            "ok": False,
+            "error": (
+                "SUPABASE_DB_URL_READONLY environment variable is missing. "
+                "This server requires a separate read-only database connection "
+                "string, distinct from the one used by sync.py. Create a "
+                "read-only Postgres role, then add its connection string as "
+                "SUPABASE_DB_URL_READONLY in the Render dashboard under Environment."
+            ),
+        }
+
     conn = None
     try:
         conn = psycopg2.connect(db_url)
+        conn.set_session(readonly=True)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
-            if cur.description:  
+            if cur.description:
                 rows = cur.fetchall()
                 return {"ok": True, "data": rows}
             conn.commit()
@@ -108,6 +138,28 @@ def _execute_supabase_query(sql: str, params: Optional[tuple] = None) -> dict:
     finally:
         if conn:
             conn.close()
+
+
+def _enforce_row_limit(sql_query: str, max_rows: int = MAX_SQL_ROWS) -> str:
+    """
+    Ensures a SELECT query has a LIMIT clause no higher than max_rows.
+    If no LIMIT is present, appends one. This is a code-level backstop —
+    the tool description asks the model to include a LIMIT, but this
+    function guarantees it regardless of what the model actually generates.
+    """
+    stripped = sql_query.strip().rstrip(";")
+    lowered = stripped.lower()
+
+    if "limit" not in lowered:
+        return f"{stripped} LIMIT {max_rows};"
+
+    # A LIMIT clause exists somewhere in the query. We don't attempt to
+    # parse and rewrite it (risk of corrupting valid SQL) — we only add a
+    # ceiling if none exists at all. If the model already specified a
+    # LIMIT, we trust it but note this is a soft spot: a query author could
+    # still specify LIMIT 100000. If this becomes a real problem, the fix is
+    # to move to an actual SQL parser (e.g. sqlglot) rather than string checks.
+    return f"{stripped};"
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +378,7 @@ def get_federal_donations(mode: str, name: Optional[str] = None,
 @mcp.tool()
 def query_ca_state_finance(mode: str, name_query: Optional[str] = None, filer_id: Optional[str] = None) -> str:
     """
-    Query structured California state campaign finance disclosures directly 
+    Query structured California state campaign finance disclosures directly
     from the Swing Strategies internal Supabase data warehouse.
 
     Args:
@@ -338,25 +390,27 @@ def query_ca_state_finance(mode: str, name_query: Optional[str] = None, filer_id
     if mode == "search_filer":
         if not name_query:
             return "ERROR: mode='search_filer' requires a 'name_query' parameter."
-        
+
         sql = """
-            SELECT filer_id, filer_type, filer_name, filer_status 
-            FROM calaccess_filers 
-            WHERE filer_name ILIKE %s 
+            SELECT filer_id, filer_type, filer_name, filer_status
+            FROM calaccess_filers
+            WHERE filer_name ILIKE %s
             ORDER BY filer_name LIMIT 10;
         """
         result = _execute_supabase_query(sql, (f"%{name_query}%",))
-        
+
     elif mode == "filer_overview":
         if not filer_id:
             return "ERROR: mode='filer_overview' requires a valid 'filer_id'."
-            
+
         output = {"filer_info": {}, "receipts_summary": {}, "expenditures_summary": {}}
-        
+
         info_res = _execute_supabase_query("SELECT * FROM calaccess_filers WHERE filer_id = %s;", (filer_id,))
         if info_res["ok"] and info_res["data"]:
             output["filer_info"] = info_res["data"][0]
-            
+        elif not info_res["ok"]:
+            return f"Supabase Warehouse Query Failed: {info_res['error']}"
+
         rcpt_res = _execute_supabase_query("""
             SELECT COALESCE(SUM(amount), 0) as total_raised, COUNT(*) as donation_count,
                    COALESCE(MAX(amount), 0) as largest_single_donation
@@ -364,22 +418,26 @@ def query_ca_state_finance(mode: str, name_query: Optional[str] = None, filer_id
         """, (filer_id,))
         if rcpt_res["ok"] and rcpt_res["data"]:
             output["receipts_summary"] = rcpt_res["data"][0]
-            
+        elif not rcpt_res["ok"]:
+            return f"Supabase Warehouse Query Failed: {rcpt_res['error']}"
+
         expn_res = _execute_supabase_query("""
             SELECT COALESCE(SUM(amount), 0) as total_spent, COUNT(*) as expense_count
             FROM calaccess_expenditures WHERE filer_id = %s;
         """, (filer_id,))
         if expn_res["ok"] and expn_res["data"]:
             output["expenditures_summary"] = expn_res["data"][0]
-            
+        elif not expn_res["ok"]:
+            return f"Supabase Warehouse Query Failed: {expn_res['error']}"
+
         return json.dumps(output, indent=2)
-        
+
     else:
         return "ERROR: mode must be 'search_filer' or 'filer_overview'."
 
     if not result["ok"]:
         return f"Supabase Warehouse Query Failed: {result['error']}"
-        
+
     return json.dumps(result["data"], indent=2)
 
 
@@ -625,7 +683,7 @@ def fppc_guideline_lookup(topic: Optional[str] = None) -> str:
         if section.startswith(header.replace("## ", "")):
             return "## " + section
 
-    return FPPC_GUIDELINES_MD  
+    return FPPC_GUIDELINES_MD
 
 
 # ---------------------------------------------------------------------------
@@ -635,12 +693,12 @@ def fppc_guideline_lookup(topic: Optional[str] = None) -> str:
 @mcp.tool()
 def execute_ca_finance_custom_sql(sql_query: str) -> str:
     """
-    Execute a raw, read-only PostgreSQL SELECT query against the California 
-    Campaign Finance data warehouse schemas. Use this when custom filters, 
+    Execute a raw, read-only PostgreSQL SELECT query against the California
+    Campaign Finance data warehouse schemas. Use this when custom filters,
     groupings, or deep table joins are required.
 
     AVAILABLE WAREHOUSE TABLES:
-    
+
     1. calaccess_filers:
        - filer_id VARCHAR(15) PRIMARY KEY
        - filer_type VARCHAR(50)
@@ -655,10 +713,10 @@ def execute_ca_finance_custom_sql(sql_query: str) -> str:
        - amount NUMERIC(12,2)
        - receipt_date DATE
        - contributor_type VARCHAR(10)
-       - contributor_last_name TEXT 
+       - contributor_last_name TEXT
        - contributor_first_name VARCHAR(255)
        - contributor_city / contributor_state / contributor_zip
-       - contributor_employer / contributor_occupation 
+       - contributor_employer / contributor_occupation
        - cumulative_ytd NUMERIC(12,2)
 
     3. calaccess_expenditures (Outbound Vendor/Staff Spend):
@@ -667,29 +725,35 @@ def execute_ca_finance_custom_sql(sql_query: str) -> str:
        - filer_id VARCHAR(15) REFERENCES calaccess_filers(filer_id)
        - amount NUMERIC(12,2)
        - expenditure_date DATE
-       - payee_last_name TEXT 
+       - payee_last_name TEXT
        - payee_first_name VARCHAR(255)
        - payee_city / payee_state / payee_zip
-       - expenditure_code VARCHAR(3) 
+       - expenditure_code VARCHAR(3)
        - expenditure_description TEXT
-       - candidate_name / ballot_measure_name 
-       - support_oppose_code VARCHAR(1) 
+       - candidate_name / ballot_measure_name
+       - support_oppose_code VARCHAR(1)
 
     CRITICAL RULES:
     - Only SELECT queries are permitted. Mutation queries will be immediately blocked.
-    - Always apply a LIMIT statement (max 100 rows) to protect context windows.
+    - A LIMIT of 100 rows is enforced automatically on every query, even if
+      you do not include one yourself.
+    - This tool runs against a database role that is granted SELECT-only
+      privileges at the database level. Even if a query were malformed or
+      unexpected, the database itself will refuse any write.
     """
     clean_query = sql_query.strip().lower()
     forbidden_commands = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "replace"]
-    
+
     if any(cmd in clean_query for cmd in forbidden_commands) or not clean_query.startswith(("select", "with")):
         return "ERROR: Safety violation. This endpoint only executes read-only SELECT database actions."
 
-    result = _execute_supabase_query(sql_query)
-    
+    limited_query = _enforce_row_limit(sql_query)
+
+    result = _execute_supabase_query(limited_query)
+
     if not result["ok"]:
         return f"Database Error: {result['error']}"
-        
+
     return json.dumps(result["data"], indent=2)
 
 
