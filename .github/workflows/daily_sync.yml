@@ -25,16 +25,17 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests psycopg2-binary
 
-    # NEW STEP: Let the native system download the file directly to disk using Chrome's profile signature
+    # FIXED: We changed the headers to match a silent binary download instead of a webpage request
     - name: Download Raw Zip File to Disk via Curl
       run: |
-        curl -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+        curl -Ssl --fail \
+             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" \
+             -H "Accept: application/zip,application/octet-stream,*/*" \
+             -H "Connection: keep-alive" \
              -L "https://campaignfinance.cdn.sos.ca.gov/rawdata/calaccess_raw_data.zip" \
              -o state_data_archive.zip
 
     - name: Run ETL Pipeline Stream
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-      # We tell Python to process the local file we just downloaded
       run: python sync.py
