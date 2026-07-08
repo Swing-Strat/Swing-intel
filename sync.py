@@ -1,17 +1,19 @@
 import os
-import io
-import zipfile
 import csv
-import requests
+import zipfile
+import io
 import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime
 
-# The official, direct link to California's daily raw database dumps
-CAL_ACCESS_ZIP_URL = "https://campaignfinance.cdn.sos.ca.gov/rawdata/calaccess_raw_data.zip"
+# Target mapping: State File Name -> Our Supabase Table
+TARGET_FILES = {
+    "Filername_CD.tsv": "calaccess_filers",
+    "Rcpt_CD.tsv": "calaccess_receipts",
+    "Expn_CD.tsv": "calaccess_expenditures"
+}
 
 def safe_float(val):
-    """Safely converts a string dollar value to a float number for database insertion."""
     if not val or val.strip() == "":
         return 0.0
     try:
@@ -20,7 +22,6 @@ def safe_float(val):
         return 0.0
 
 def safe_int(val):
-    """Safely converts a string to an integer."""
     if not val or val.strip() == "":
         return None
     try:
@@ -29,10 +30,9 @@ def safe_int(val):
         return None
 
 def safe_date(val):
-    """Normalizes various California date formatting strings into clean SQL YYYY-MM-DD."""
     if not val or val.strip() == "":
         return None
-    cleaned = val.strip().split(" ")[0]  # strip off timestamps if present
+    cleaned = val.strip().split(" ")[0]
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d-%b-%y", "%m/%d/%y"):
         try:
             return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
@@ -41,7 +41,6 @@ def safe_date(val):
     return None
 
 def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, conn):
-    """Finds a file in the ZIP, reads it, transforms rows, and loads into database."""
     target_filename = None
     for f in the_zip.namelist():
         if filename_keyword.lower() in f.lower():
@@ -55,10 +54,7 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
     print(f"Processing and cleaning entries from state file: {target_filename}...")
     
     with the_zip.open(target_filename) as raw_file:
-        # Wrap file stream to safely skip corrupted accents or text formatting relics from legacy state records
         text_file = io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore')
-        
-        # State files are standard Tab-Delimited text formats
         reader = csv.DictReader(text_file, delimiter='\t')
         
         batch = []
@@ -70,12 +66,10 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
                 if parsed_record:
                     batch.append(parsed_record)
                 
-                # Write to database in optimized chunks to protect network performance
                 if len(batch) >= batch_size:
                     execute_batch(cur, insert_sql, batch)
                     batch = []
             
-            # Flush any remaining rows
             if batch:
                 execute_batch(cur, insert_sql, batch)
 
@@ -83,86 +77,43 @@ def parse_filer(row):
     first = row.get("FIRST_NAME", "").strip()
     last = row.get("LAST_NAME", "").strip()
     full_name = f"{first} {last}".strip() if first else last
-    
     if not row.get("FILER_ID"):
         return None
-        
-    return (
-        row.get("FILER_ID", "").strip(),
-        row.get("FILER_TYPE", "").strip(),
-        full_name,
-        row.get("FILER_STATUS", "").strip(),
-        first,
-        last
-    )
+    return (row.get("FILER_ID", "").strip(), row.get("FILER_TYPE", "").strip(), full_name, row.get("FILER_STATUS", "").strip(), first, last)
 
 def parse_receipt(row):
     if not row.get("FILER_ID"):
         return None
-    return (
-        safe_int(row.get("FILING_ID")),
-        row.get("FILER_ID", "").strip(),
-        safe_float(row.get("AMOUNT")),
-        safe_date(row.get("RCVD_DATE") or row.get("DATE_RCVD")),
-        row.get("CTRIB_TYP", "").strip(),
-        row.get("CTRIB_NAM_L", "").strip(),
-        row.get("CTRIB_NAM_F", "").strip(),
-        row.get("CTRIB_CITY", "").strip(),
-        row.get("CTRIB_ST", "").strip(),
-        row.get("CTRIB_ZIP4", "").strip(),
-        row.get("CTRIB_EMP", "").strip(),
-        row.get("CTRIB_OCC", "").strip(),
-        safe_float(row.get("CUM_YTD"))
-    )
+    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), safe_date(row.get("RCVD_DATE") or row.get("DATE_RCVD")), row.get("CTRIB_TYP", "").strip(), row.get("CTRIB_NAM_L", "").strip(), row.get("CTRIB_NAM_F", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
 
 def parse_expenditure(row):
     if not row.get("FILER_ID"):
         return None
-    return (
-        safe_int(row.get("FILING_ID")),
-        row.get("FILER_ID", "").strip(),
-        safe_float(row.get("AMOUNT")),
-        safe_date(row.get("EXPN_DATE")),
-        row.get("PAYEE_NAM_L", "").strip(),
-        row.get("PAYEE_NAM_F", "").strip(),
-        row.get("PAYEE_CITY", "").strip(),
-        row.get("PAYEE_ST", "").strip(),
-        row.get("PAYEE_ZIP4", "").strip(),
-        row.get("EXPN_CODE", "").strip(),
-        row.get("EXPN_DSCR", "").strip(),
-        row.get("CAND_NAM_L", "").strip(),
-        row.get("BAL_NAME", "").strip(),
-        row.get("SUP_OPP_CD", "").strip()
-    )
+    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), safe_date(row.get("EXPN_DATE")), row.get("PAYEE_NAM_L", "").strip(), row.get("PAYEE_NAM_F", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAM_L", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
 
 def run_daily_sync():
     db_url = os.environ.get("SUPABASE_DB_URL")
     if not db_url:
-        print("❌ Critical Abort: SUPABASE_DB_URL environment variable is missing.")
+        print("Delta Abort: SUPABASE_DB_URL is missing.")
         return
 
-    print("Step 1: Downloading compressed raw data matrix from CA Secretary of State...")
-    
-    # NEW DISGUISE FIX: We add headers so the state's server thinks we are a standard Google Chrome browser
-    browser_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    
-    response = requests.get(CAL_ACCESS_ZIP_URL, headers=browser_headers, stream=True)
-    response.raise_for_status()
-    zip_buffer = io.BytesIO(response.content)
-    
-    print("Step 2: Connecting to your Supabase Data Warehouse cluster...")
+    # FIXED: We look directly on the hard drive for the file downloaded by the workflow
+    local_zip_path = "state_data_archive.zip"
+    if not os.path.exists(local_zip_path):
+        print(f"❌ Error: Could not find the local file '{local_zip_path}' on disk.")
+        return
+
+    print("Step 1: Successfully detected local data file archive. Connecting to Supabase...")
     conn = psycopg2.connect(db_url)
     
     try:
-        print("Step 3: Flushing out legacy data rows...")
+        print("Step 2: Flushing out legacy data rows...")
         with conn.cursor() as cur:
             cur.execute("TRUNCATE TABLE calaccess_receipts, calaccess_expenditures, calaccess_filers CASCADE;")
         conn.commit()
         
-        print("Step 4: Executing ETL data parsing and structural streaming...")
-        with zipfile.ZipFile(zip_buffer) as the_zip:
+        print("Step 3: Opening archive and processing ETL updates...")
+        with zipfile.ZipFile(local_zip_path) as the_zip:
             
             # Load Filers
             process_file_data(
