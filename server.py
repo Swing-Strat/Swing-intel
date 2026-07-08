@@ -10,6 +10,18 @@ SECURITY NOTE: Every external API key is read from an environment variable
 at call time via os.environ.get(). Nothing is hardcoded. If a key is
 missing, the affected tool returns a clear error message rather than
 failing silently or fabricating data.
+
+CHANGELOG:
+- Fixed get_federal_donations(mode="candidate_totals") — endpoint was
+  incorrectly pluralized as /candidates/{id}/totals/. FEC's actual
+  endpoint is singular: /candidate/{id}/totals/. Confirmed against
+  OpenFEC's own documented URL pattern.
+- Expanded search_local_county_finance() jurisdiction coverage from
+  3 jurisdictions (Sacramento, Orange County, Irvine) to 10 major CA
+  cities/regions. See notes on Los Angeles and San Francisco below —
+  both have better authoritative sources (LA Ethics CAMS, SF DataSF
+  SODA API) than generic NetFile/portal search, and are flagged as
+  candidates for dedicated future tools rather than this catch-all.
 """
 
 import os
@@ -273,7 +285,10 @@ def get_federal_donations(mode: str, name: Optional[str] = None,
     elif mode == "candidate_totals":
         if not candidate_id or not cycle:
             return "ERROR: mode='candidate_totals' requires candidate_id and cycle."
-        result = _safe_get(f"{base_url}/candidates/{candidate_id}/totals/",
+        # FIX: this endpoint is singular ("candidate", not "candidates").
+        # Confirmed against OpenFEC's documented URL pattern:
+        # https://api.open.fec.gov/v1/candidate/{candidate_id}/totals/
+        result = _safe_get(f"{base_url}/candidate/{candidate_id}/totals/",
                             params={**params_common, "cycle": cycle})
     elif mode == "search_committee":
         if not name:
@@ -371,7 +386,37 @@ def search_ca_state_finance(mode: str, filer_name: Optional[str] = None,
 
 
 # ---------------------------------------------------------------------------
-# TOOL 6 — Local County/City Campaign Finance (Exa search over public portals)
+# TOOL 6 — Local City/County Campaign Finance (Exa search over public portals)
+# ---------------------------------------------------------------------------
+#
+# COVERAGE NOTES:
+#
+# - This tool is a search-lead generator, not a structured data API. Every
+#   jurisdiction below ultimately runs on NetFile, a legacy county/city
+#   clerk portal, or a jurisdiction-specific site — none expose usable
+#   JSON. Treat every result as something a human must verify on the
+#   actual portal before it's used in any output.
+#
+# - The `site:` filters below are best-effort domain patterns based on how
+#   each jurisdiction's portal is typically structured, NOT independently
+#   verified for every jurisdiction. If a jurisdiction returns weak or no
+#   results, check the manual_portals URL directly and consider updating
+#   the site filter — do not assume zero results means zero activity.
+#
+# - Los Angeles: The authoritative source for LA city/county races is the
+#   LA Ethics Commission's CAMS system, not NetFile. CAMS has no public
+#   API (confirmed limitation — see project notes). This tool's LA entry
+#   is a fallback web-search lead generator only; it does NOT query CAMS.
+#   A dedicated CAMS-aware tool is a candidate for future work, but CAMS's
+#   lack of an API means that would likely also be search/scrape-based
+#   rather than a clean structured integration.
+#
+# - San Francisco: SF has a real, documented open-data API — DataSF's SODA
+#   endpoint — which is a better long-term fit than generic search leads
+#   for SF races. This tool's SF entry is a search-lead fallback only, not
+#   a DataSF integration. A dedicated SF tool built on the SODA API is a
+#   good candidate for a future, higher-fidelity addition.
+#
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -381,20 +426,30 @@ def search_local_county_finance(candidate_or_committee_name: str,
     Search for local city/county campaign finance disclosures (Form 460s and
     equivalent) via targeted web search over known public portals.
 
-    IMPORTANT KNOWN LIMITATION: NetFile's API does not return usable JSON —
-    it redirects to its front-end portal. This tool does NOT call a NetFile
-    API. Instead it runs a scoped web search (via Exa) restricted to known
-    public disclosure portal domains and returns links/snippets for a human
-    or downstream Claude call to review. Treat results as leads to verify
-    manually on the portal, not as structured, machine-parsed filing data.
+    IMPORTANT KNOWN LIMITATION: This tool does not call a structured API for
+    any jurisdiction. NetFile's own API does not return usable JSON — it
+    redirects to its front-end portal — and most other local portals below
+    have no public API at all. Instead this tool runs a scoped web search
+    (via Exa) restricted to known public disclosure portal domains and
+    returns links/snippets for a human or downstream Claude call to review.
+    Treat every result as a lead to verify manually on the portal, not as
+    structured, machine-parsed filing data.
+
+    Los Angeles and San Francisco have better authoritative sources (LA
+    Ethics CAMS and SF DataSF's SODA API respectively) than this tool's
+    generic search-lead approach — see the module-level notes above this
+    function. Use this tool for LA/SF only as a starting point, and always
+    surface the manual_verification_url for those two jurisdictions.
 
     Args:
         candidate_or_committee_name: The candidate, committee, or measure name.
-        jurisdiction: One of "sacramento", "orange_county", "irvine", "other".
+        jurisdiction: One of "sacramento", "orange_county", "irvine",
+                      "los_angeles", "san_francisco", "san_diego", "san_jose",
+                      "long_beach", "oakland", "fresno", "bakersfield", "other".
                       Determines which portal domains are prioritized.
 
     Returns a JSON string of search results (title, url, snippet) plus the
-    manual-lookup portal URLs for the chosen jurisdiction.
+    manual-lookup portal URL for the chosen jurisdiction.
     """
     api_key = os.environ.get("EXA_API_KEY")
 
@@ -412,6 +467,38 @@ def search_local_county_finance(candidate_or_committee_name: str,
             "site:cityofirvine.org",
             "site:netfile.com/public/Irvine",
         ],
+        "los_angeles": [
+            "site:ethics.lacity.org",
+            "site:lacity.org",
+        ],
+        "san_francisco": [
+            "site:sfethics.org",
+            "site:data.sfgov.org",
+        ],
+        "san_diego": [
+            "site:sandiego.gov",
+            "site:netfile.com/public/SanDiego",
+        ],
+        "san_jose": [
+            "site:sanjoseca.gov",
+            "site:netfile.com/public/SanJose",
+        ],
+        "long_beach": [
+            "site:longbeach.gov",
+            "site:netfile.com/public/LongBeach",
+        ],
+        "oakland": [
+            "site:oaklandca.gov",
+            "site:netfile.com/public/Oakland",
+        ],
+        "fresno": [
+            "site:fresno.gov",
+            "site:netfile.com/public/Fresno",
+        ],
+        "bakersfield": [
+            "site:bakersfieldcity.us",
+            "site:netfile.com/public/Bakersfield",
+        ],
         "other": [
             "site:netfile.com/public",
         ],
@@ -421,6 +508,14 @@ def search_local_county_finance(candidate_or_committee_name: str,
         "sacramento": "https://www.saccounty.gov/elections/Pages/Campaign-Disclosure.aspx",
         "orange_county": "https://ocvote.gov/campaign/",
         "irvine": "https://cityofirvine.org/city-clerk/campaign-finance-disclosure",
+        "los_angeles": "https://ethics.lacity.org/disclosure-programs/cams/",
+        "san_francisco": "https://sfethics.org/disclosure/campaign-finance-disclosure",
+        "san_diego": "https://www.sandiego.gov/city-clerk/officialdocs/campaign-disclosure",
+        "san_jose": "https://www.sanjoseca.gov/your-government/departments-offices/city-clerk/campaign-finance-disclosure",
+        "long_beach": "https://www.longbeach.gov/cityclerk/campaign-finance/",
+        "oakland": "https://www.oaklandca.gov/services/search-campaign-finance-disclosure-statements",
+        "fresno": "https://www.fresno.gov/cityclerk/campaign-disclosure/",
+        "bakersfield": "https://www.bakersfieldcity.us/298/City-Clerk",
         "other": "https://netfile.com/public/",
     }
 
@@ -455,9 +550,12 @@ def search_local_county_finance(candidate_or_committee_name: str,
     output = {
         "search_results": result["data"],
         "manual_verification_url": manual_portals[jurisdiction],
-        "note": ("These are search leads, not parsed filing data. NetFile's own "
-                 "API is non-functional (confirmed: redirects to portal, no JSON). "
-                 "Verify every figure directly on the portal before using it."),
+        "note": ("These are search leads, not parsed filing data. Most local "
+                 "portals (NetFile and otherwise) have no usable public API. "
+                 "Verify every figure directly on the portal before using it. "
+                 "For Los Angeles, the authoritative source is LA Ethics CAMS; "
+                 "for San Francisco, consider SF DataSF's SODA API for a more "
+                 "structured lookup than this generic search."),
     }
     return json.dumps(output, indent=2)
 
