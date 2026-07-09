@@ -6,6 +6,15 @@ on:
     - cron: '0 12 * * *'
   workflow_dispatch: # Allows manual one-click testing inside GitHub anytime
 
+# Prevents a scheduled run from overlapping a manual run (or another
+# scheduled run still in progress). Each run does TRUNCATE + full reload in
+# one transaction; two instances running at once step on each other and can
+# leave the tables in a state where filers loaded but receipts/expenditures
+# didn't (see July 2026 incident).
+concurrency:
+  group: daily-supabase-sync
+  cancel-in-progress: true
+
 jobs:
   sync-data:
     runs-on: ubuntu-latest
