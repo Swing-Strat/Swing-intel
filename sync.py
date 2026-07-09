@@ -5,7 +5,41 @@ import io
 import requests
 import psycopg2
 from psycopg2.extras import execute_batch
-from datetime import datetime
+from datetime import datetime, date
+
+# How far back to load receipts and expenditures. The state's export is a
+# full historical dump going back decades; most of that is far more than a
+# working research tool needs, and skipping it up front means much less data
+# to parse, insert, and store. Filers are NOT filtered by this — every filer
+# is kept regardless of age, since receipts/expenditures have a foreign key
+# to calaccess_filers and a within-range transaction referencing an
+# out-of-range filer would otherwise fail to insert. The filer registry is
+# also comparatively small next to the transaction tables, so there isn't
+# much to gain from filtering it too. Override with the SYNC_YEARS_BACK env
+# var if you want a different window without editing code.
+YEARS_BACK = int(os.environ.get("SYNC_YEARS_BACK", "5"))
+
+def _cutoff_date():
+    today = date.today()
+    try:
+        return today.replace(year=today.year - YEARS_BACK)
+    except ValueError:
+        # today is Feb 29 and (today.year - YEARS_BACK) isn't a leap year
+        return today.replace(month=2, day=28, year=today.year - YEARS_BACK)
+
+CUTOFF_DATE = _cutoff_date()
+
+def _is_recent(iso_date_str):
+    """True if iso_date_str (as returned by safe_date, 'YYYY-MM-DD' or None)
+    falls on or after CUTOFF_DATE. Rows with a missing/unparseable date are
+    treated as NOT recent and get skipped — we can't confirm they're in
+    range, so the safer default is to leave them out rather than guess."""
+    if not iso_date_str:
+        return False
+    try:
+        return datetime.strptime(iso_date_str, "%Y-%m-%d").date() >= CUTOFF_DATE
+    except ValueError:
+        return False
 
 def safe_float(val):
     if not val or val.strip() == "":
@@ -156,18 +190,26 @@ def parse_filer(row):
 def parse_receipt(row):
     if not row.get("FILER_ID"):
         return None
-    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), safe_date(row.get("RCVD_DATE") or row.get("DATE_RCVD")), row.get("CTRIB_TYP", "").strip(), row.get("CTRIB_NAM_L", "").strip(), row.get("CTRIB_NAM_F", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
+    receipt_date = safe_date(row.get("RCVD_DATE") or row.get("DATE_RCVD"))
+    if not _is_recent(receipt_date):
+        return None
+    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), receipt_date, row.get("CTRIB_TYP", "").strip(), row.get("CTRIB_NAM_L", "").strip(), row.get("CTRIB_NAM_F", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
 
 def parse_expenditure(row):
     if not row.get("FILER_ID"):
         return None
-    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), safe_date(row.get("EXPN_DATE")), row.get("PAYEE_NAM_L", "").strip(), row.get("PAYEE_NAM_F", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAM_L", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
+    expenditure_date = safe_date(row.get("EXPN_DATE"))
+    if not _is_recent(expenditure_date):
+        return None
+    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), expenditure_date, row.get("PAYEE_NAM_L", "").strip(), row.get("PAYEE_NAM_F", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAM_L", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
 
 def run_daily_sync():
     db_url = os.environ.get("SUPABASE_DB_URL")
     if not db_url:
         print("❌ Core Abort: SUPABASE_DB_URL target path missing.")
         return
+
+    print(f"Loading receipts and expenditures dated {CUTOFF_DATE.isoformat()} or later ({YEARS_BACK} year(s) back). All filers are loaded regardless of date.")
 
     local_zip_path = download_calaccess_export()
 
