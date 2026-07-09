@@ -3,8 +3,3 @@
 fastmcp>=3.4.3,<3.5
 requests>=2.32
 psycopg2-binary>=2.9
-# Official Big Local News client (github.com/biglocalnews/bln-python-client).
-# Replaces a hand-rolled REST integration in sync.py that was calling
-# endpoints that don't exist (the real API is GraphQL). Upper-bounded on the
-# same reasoning as fastmcp above — verify before letting a major bump in.
-bln>=2.3.0,<3.0
