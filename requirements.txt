@@ -1,3 +1,5 @@
-fastmcp
-requests
-psycopg2-binary
+# Pin fastmcp with an upper bound. 3.4.3 shipped default-on host-origin
+# protection as a "patch" release; unbounded pins are how you get surprise 421s.
+fastmcp>=3.4.3,<3.5
+requests>=2.32
+psycopg2-binary>=2.9
