@@ -2,7 +2,6 @@ import os
 import csv
 import zipfile
 import io
-import requests
 import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime
@@ -35,87 +34,74 @@ def safe_date(val):
     return None
 
 def download_from_big_local_news():
-    """Connects to Stanford's API, dynamically finds the CalAccess project, and downloads the archive."""
-    token = os.environ.get("BLN_API_KEY")
+    """
+    Finds the CalAccess project on Big Local News and downloads its data
+    archive, using the official `bln` client (pip package `bln`,
+    https://github.com/biglocalnews/bln-python-client) instead of hand-rolled
+    HTTP calls.
+
+    This replaces a previous version of this function that called
+    https://api.biglocalnews.org/projects/ and a /api/v1/ variant with a
+    "Token <key>" auth header. Neither of those is BLN's real API: BLN's API
+    is GraphQL, served at https://api.biglocalnews.org/graphql, and expects
+    "JWT <token>" auth. The old code would silently fail every single run and
+    fall back to looking for a local zip that never existed in CI. The `bln`
+    client handles the real GraphQL calls and the file-download URL exchange
+    correctly, so we use it directly rather than re-implementing that.
+
+    The client reads its token from the BLN_API_TOKEN environment variable
+    (that's the name the library itself expects — see daily_sync.yml, which
+    maps the BLN_API_KEY GitHub secret onto that variable name for this
+    step).
+    """
     local_filename = "state_data_archive.zip"
 
-    if not token:
-        print("ℹ️ BLN_API_KEY variable not found. Assuming local testing; searching for local zip asset...")
+    if not os.environ.get("BLN_API_TOKEN"):
+        print("ℹ️ BLN_API_TOKEN variable not found. Assuming local testing; searching for local zip asset...")
         return local_filename
 
-    print("Step 1: Connecting to Stanford's Big Local News API platform...")
-    headers = {"Authorization": f"Token {token}"}
+    from bln import Client  # imported here so a missing/broken BLN token never blocks local dev without the package
 
-    # Check alternate Stanford REST API endpoint nodes
-    endpoints = ["https://api.biglocalnews.org/projects/", "https://api.biglocalnews.org/api/v1/projects/"]
-    projects = []
+    print("Step 1: Connecting to Big Local News via the official bln client...")
+    client = Client()
 
-    for url in endpoints:
-        try:
-            res = requests.get(url, headers=headers, timeout=15)
-            if res.status_code == 200:
-                data = res.json()
-                projects = data.get("results", data) if isinstance(data, dict) else data
-                break
-        except Exception:
-            continue
-
-    if not projects or not isinstance(projects, list):
-        print("⚠️ Warning: Could not authenticate or parse project matrix from BLN. Checking for local zip...")
+    try:
+        matches = client.search_projects(
+            lambda p: "california" in p.get("name", "").lower() and "campaign" in p.get("name", "").lower()
+        )
+    except Exception as e:
+        print(f"⚠️ Warning: BLN project search failed ({e}). Checking for local zip...")
         return local_filename
 
-    # Scan project catalog for the matching California Campaign dataset
-    target_project = None
-    for p in projects:
-        name = p.get("name", "").lower()
-        if "california" in name and "campaign" in name:
-            target_project = p
-            break
-
-    if not target_project:
-        print("⚠️ Warning: 'California campaign finance data' project directory not found in this BLN profile.")
+    if not matches:
+        print("⚠️ Warning: 'California campaign finance data' project not found in this BLN account.")
         return local_filename
 
-    project_id = target_project.get("id")
-    print(f"📂 Found Linked Stanford Project Asset: {target_project.get('name')} (ID: {project_id})")
+    project = matches[0]
+    project_id = project.get("id")
+    print(f"📂 Found project: {project.get('name')} (ID: {project_id})")
 
-    # Fetch file asset manifest
-    files_url = f"https://api.biglocalnews.org/projects/{project_id}/files/"
-    res = requests.get(files_url, headers=headers, timeout=15)
-    if res.status_code != 200:
-        res = requests.get(f"https://api.biglocalnews.org/api/v1/projects/{project_id}/files/", headers=headers, timeout=15)
-
-    if res.status_code != 200:
-        print("⚠️ Warning: Access denied reading project asset map from Stanford catalog.")
-        return local_filename
-
-    file_data = res.json()
-    files = file_data.get("results", file_data) if isinstance(file_data, dict) else file_data
-
-    # Locate the target compressed data matrix zip file
     target_file = None
-    for f in files:
+    for f in project.get("files", []):
         fname = f.get("name", "")
         if fname.endswith(".zip") or "raw" in fname.lower():
             target_file = f
             break
 
     if not target_file:
-        print("⚠️ Warning: Could not locate a valid raw processing data .zip package inside the project.")
+        print("⚠️ Warning: Could not locate a .zip data file inside this BLN project.")
         return local_filename
 
-    file_id = target_file.get("id") or target_file.get("name")
-    download_url = f"https://api.biglocalnews.org/projects/{project_id}/files/{file_id}/download/"
+    filename = target_file["name"]
+    print(f"📥 Downloading {filename} via the bln client...")
+    try:
+        client.download_file(project_id, filename, output_dir=".")
+    except Exception as e:
+        print(f"⚠️ Warning: BLN file download failed ({e}). Checking for local zip...")
+        return local_filename
 
-    print(f"📥 Downloading latest daily clean data mirror directly from Stanford cluster...")
-    with requests.get(download_url, headers=headers, stream=True, timeout=90) as r:
-        r.raise_for_status()
-        with open(local_filename, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 64):
-                f.write(chunk)
-
-    print("✅ Transfer complete! File cleanly cached onto automated workflow workspace.")
-    return local_filename
+    print("✅ Transfer complete!")
+    return filename
 
 def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, conn):
     """
