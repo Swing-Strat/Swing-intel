@@ -23,14 +23,9 @@ jobs:
     - name: Install DB & Sync Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests psycopg2-binary bln
+        pip install requests psycopg2-binary
 
     - name: Run Integrated Download and Sync Pipeline
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        # The bln client library reads BLN_API_TOKEN specifically (not
-        # BLN_API_KEY) — mapping the existing secret name onto the variable
-        # name the library actually expects, so nothing needs to change in
-        # GitHub's secret settings.
-        BLN_API_TOKEN: ${{ secrets.BLN_API_KEY }}
       run: python sync.py
