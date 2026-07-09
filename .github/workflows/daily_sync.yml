@@ -23,11 +23,14 @@ jobs:
     - name: Install DB & Sync Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests psycopg2-binary
+        pip install requests psycopg2-binary bln
 
     - name: Run Integrated Download and Sync Pipeline
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        BLN_API_KEY: ${{ secrets.BLN_API_KEY }}
-      # Python now handles the secure Stanford download and the database ingestion completely
+        # The bln client library reads BLN_API_TOKEN specifically (not
+        # BLN_API_KEY) — mapping the existing secret name onto the variable
+        # name the library actually expects, so nothing needs to change in
+        # GitHub's secret settings.
+        BLN_API_TOKEN: ${{ secrets.BLN_API_KEY }}
       run: python sync.py
