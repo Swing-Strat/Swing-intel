@@ -6,6 +6,15 @@ on:
     - cron: '0 12 * * *'
   workflow_dispatch: # Allows manual one-click testing inside GitHub anytime
 
+# sync.py's TRUNCATE + reload is one transaction, committed once at the end.
+# Two runs overlapping (e.g. a manual dispatch landing during the scheduled
+# run) each do their own TRUNCATE, stepping on each other's transaction and
+# leaving the tables in a partial state. cancel-in-progress ensures a new
+# run always supersedes rather than races an old one.
+concurrency:
+  group: daily-supabase-sync
+  cancel-in-progress: true
+
 jobs:
   sync-data:
     runs-on: ubuntu-latest
