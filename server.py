@@ -128,10 +128,17 @@ def query_ca_state_finance(mode: str, name_query: Optional[str] = None, filer_id
         sql = "SELECT filer_id, filer_type, filer_name FROM calaccess_filers WHERE filer_name ILIKE %s LIMIT 10;"
         result = _execute_supabase_query(sql, (f"%{name_query}%",))
     else:
-        output = {"filer_info": {}, "receipts_summary": {}}
+        # NOTE: this branch used to swallow query failures — if the DB call
+        # failed (bad connection string, auth error, etc.) it silently
+        # returned {"filer_info": {}, "receipts_summary": {}} with no
+        # indication anything was wrong, which is indistinguishable from a
+        # real "no matching filer" result. Failures are now surfaced.
         res = _execute_supabase_query("SELECT * FROM calaccess_filers WHERE filer_id = %s;", (filer_id,))
-        if res["ok"] and res["data"]: output["filer_info"] = res["data"][0]
-        result = {"ok": True, "data": output}
+        if not res["ok"]:
+            result = {"ok": False, "error": res["error"]}
+        else:
+            output = {"filer_info": res["data"][0] if res["data"] else {}, "receipts_summary": {}}
+            result = {"ok": True, "data": output}
     return json.dumps(result.get("data", result), indent=2)
 
 @mcp.tool()
