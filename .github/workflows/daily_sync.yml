@@ -28,4 +28,9 @@ jobs:
     - name: Run Integrated Download and Sync Pipeline
       env:
         SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        # Without this, Python fully buffers stdout when it isn't attached to
+        # a real terminal (true of GitHub Actions), so log lines don't show
+        # up until the buffer fills or the script exits — the job can be
+        # doing real work for many minutes while the log looks empty.
+        PYTHONUNBUFFERED: '1'
       run: python sync.py
