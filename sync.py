@@ -2,6 +2,7 @@ import os
 import csv
 import zipfile
 import io
+import requests
 import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime
@@ -33,75 +34,33 @@ def safe_date(val):
             continue
     return None
 
-def download_from_big_local_news():
+CALACCESS_EXPORT_URL = "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
+
+def download_calaccess_export():
     """
-    Finds the CalAccess project on Big Local News and downloads its data
-    archive, using the official `bln` client (pip package `bln`,
-    https://github.com/biglocalnews/bln-python-client) instead of hand-rolled
-    HTTP calls.
+    Downloads the CAL-ACCESS raw data export directly from the California
+    Secretary of State. No account or API key required — this is a public,
+    unauthenticated URL that the state refreshes once a day:
+    https://www.sos.ca.gov/campaign-lobbying/helpful-resources/raw-data-campaign-finance-and-lobbying-activity
 
-    This replaces a previous version of this function that called
-    https://api.biglocalnews.org/projects/ and a /api/v1/ variant with a
-    "Token <key>" auth header. Neither of those is BLN's real API: BLN's API
-    is GraphQL, served at https://api.biglocalnews.org/graphql, and expects
-    "JWT <token>" auth. The old code would silently fail every single run and
-    fall back to looking for a local zip that never existed in CI. The `bln`
-    client handles the real GraphQL calls and the file-download URL exchange
-    correctly, so we use it directly rather than re-implementing that.
-
-    The client reads its token from the BLN_API_TOKEN environment variable
-    (that's the name the library itself expects — see daily_sync.yml, which
-    maps the BLN_API_KEY GitHub secret onto that variable name for this
-    step).
+    This replaces the previous Big Local News integration. BLN mirrors the
+    same underlying data and is a legitimate source in its own right, but it
+    requires an account with project-level access, which turned out to be a
+    real ongoing failure point (an invalid token, then later a valid token
+    on an account that wasn't a member of the project). Downloading straight
+    from the state removes that entire dependency — there's no
+    authentication step here that can expire, get revoked, or be scoped to
+    the wrong project.
     """
     local_filename = "state_data_archive.zip"
-
-    if not os.environ.get("BLN_API_TOKEN"):
-        print("ℹ️ BLN_API_TOKEN variable not found. Assuming local testing; searching for local zip asset...")
-        return local_filename
-
-    from bln import Client  # imported here so a missing/broken BLN token never blocks local dev without the package
-
-    print("Step 1: Connecting to Big Local News via the official bln client...")
-    client = Client()
-
-    try:
-        matches = client.search_projects(
-            lambda p: "california" in p.get("name", "").lower() and "campaign" in p.get("name", "").lower()
-        )
-    except Exception as e:
-        print(f"⚠️ Warning: BLN project search failed ({e}). Checking for local zip...")
-        return local_filename
-
-    if not matches:
-        print("⚠️ Warning: 'California campaign finance data' project not found in this BLN account.")
-        return local_filename
-
-    project = matches[0]
-    project_id = project.get("id")
-    print(f"📂 Found project: {project.get('name')} (ID: {project_id})")
-
-    target_file = None
-    for f in project.get("files", []):
-        fname = f.get("name", "")
-        if fname.endswith(".zip") or "raw" in fname.lower():
-            target_file = f
-            break
-
-    if not target_file:
-        print("⚠️ Warning: Could not locate a .zip data file inside this BLN project.")
-        return local_filename
-
-    filename = target_file["name"]
-    print(f"📥 Downloading {filename} via the bln client...")
-    try:
-        client.download_file(project_id, filename, output_dir=".")
-    except Exception as e:
-        print(f"⚠️ Warning: BLN file download failed ({e}). Checking for local zip...")
-        return local_filename
-
+    print("Step 1: Downloading CAL-ACCESS raw data directly from the CA Secretary of State...")
+    with requests.get(CALACCESS_EXPORT_URL, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(local_filename, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 64):
+                f.write(chunk)
     print("✅ Transfer complete!")
-    return filename
+    return local_filename
 
 def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, conn):
     """
@@ -210,8 +169,7 @@ def run_daily_sync():
         print("❌ Core Abort: SUPABASE_DB_URL target path missing.")
         return
 
-    # Call the new adaptive Stanford downloader engine
-    local_zip_path = download_from_big_local_news()
+    local_zip_path = download_calaccess_export()
 
     if not os.path.exists(local_zip_path):
         print(f"❌ Abort: Local staging archive cache file '{local_zip_path}' could not be resolved.")
