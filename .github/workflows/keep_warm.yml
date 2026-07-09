@@ -1,0 +1,18 @@
+# .github/workflows/keep_warm.yml
+# Pings the Render service so the free-tier instance doesn't spin down
+# (Render free tier sleeps after ~15 min idle; cold start is 30-60s, which
+# exceeds Claude's connector validation timeout).
+# Note: GitHub cron is best-effort and can drift several minutes. Running
+# 24/7 uses ~744 instance-hours/month, inside Render's 750-hour free limit
+# for a single service.
+name: Keep Render Warm
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: curl -sf --max-time 60 https://mcp-1st-try.onrender.com/health || true
