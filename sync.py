@@ -31,13 +31,20 @@ CUTOFF_DATE = _cutoff_date()
 
 def _is_recent(iso_date_str):
     """True if iso_date_str (as returned by safe_date, 'YYYY-MM-DD' or None)
-    falls on or after CUTOFF_DATE. Rows with a missing/unparseable date are
-    treated as NOT recent and get skipped — we can't confirm they're in
-    range, so the safer default is to leave them out rather than guess."""
+    falls on or after CUTOFF_DATE and not after today. Rows with a
+    missing/unparseable date are treated as NOT recent and get skipped —
+    we can't confirm they're in range, so the safer default is to leave
+    them out rather than guess.
+
+    The upper bound matters: this is 25 years of manually-entered filings,
+    and a handful of rows have a data-entry-error date far in the future
+    (e.g. a typo'd 4-digit year like 2119). Without a ceiling those pass
+    the >= CUTOFF_DATE check and get miscounted as recent."""
     if not iso_date_str:
         return False
     try:
-        return datetime.strptime(iso_date_str, "%Y-%m-%d").date() >= CUTOFF_DATE
+        parsed = datetime.strptime(iso_date_str, "%Y-%m-%d").date()
+        return CUTOFF_DATE <= parsed <= date.today()
     except ValueError:
         return False
 
@@ -67,6 +74,14 @@ def safe_date(val):
         except ValueError:
             continue
     return None
+
+def _clean_tsv_lines(text_file):
+    """Some CalAccess TSVs (CVR_CAMPAIGN_DISCLOSURE_CD.TSV in particular)
+    contain embedded NUL bytes in free-text fields, which crashes Python's
+    csv module ('line contains NUL') before a single row is read. Strip
+    them at the line level so csv.DictReader never sees one."""
+    for line in text_file:
+        yield line.replace("\0", "")
 
 CALACCESS_EXPORT_URL = "https://campaignfinance.cdn.sos.ca.gov/dbwebexport.zip"
 
@@ -133,7 +148,7 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
 
     with the_zip.open(target_filename) as raw_file:
         text_file = io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore')
-        reader = csv.DictReader(text_file, delimiter='\t')
+        reader = csv.DictReader(_clean_tsv_lines(text_file), delimiter='\t')
 
         batch = []
         batch_size = 2000
@@ -180,28 +195,79 @@ def process_file_data(the_zip, filename_keyword, row_parser_func, insert_sql, co
     print(f"  -> {target_filename}: {inserted} rows inserted, {skipped} rows skipped (bad or orphaned data).")
 
 def parse_filer(row):
-    first = row.get("FIRST_NAME", "").strip()
-    last = row.get("LAST_NAME", "").strip()
+    # The real FILERNAME_CD.TSV columns are NAML/NAMF/STATUS, not
+    # FIRST_NAME/LAST_NAME/FILER_STATUS (those never existed in this file —
+    # every previously-loaded filer had a blank filer_name, which made
+    # search_filer's `ILIKE` lookup match nothing). Confirmed against the
+    # real export's header, not assumed.
+    first = row.get("NAMF", "").strip()
+    last = row.get("NAML", "").strip()
     full_name = f"{first} {last}".strip() if first else last
     if not row.get("FILER_ID"):
         return None
-    return (row.get("FILER_ID", "").strip(), row.get("FILER_TYPE", "").strip(), full_name, row.get("FILER_STATUS", "").strip(), first, last)
+    return (row.get("FILER_ID", "").strip(), row.get("FILER_TYPE", "").strip(), full_name, row.get("STATUS", "").strip(), first, last)
 
-def parse_receipt(row):
-    if not row.get("FILER_ID"):
+def load_filing_to_filer_map(the_zip):
+    """
+    RCPT_CD.TSV and EXPN_CD.TSV carry no FILER_ID column at all (only
+    FILING_ID, plus a CMTE_ID that's populated on <10% of rows and means
+    something different — an intermediary committee, not the primary
+    filer). Every receipt/expenditure row used to fail the `if not
+    row.get("FILER_ID")` check and get silently dropped, which is why the
+    tables were always empty regardless of how the sync ran.
+
+    The real FILING_ID -> FILER_ID mapping lives on each filing's cover
+    sheet, CVR_CAMPAIGN_DISCLOSURE_CD.TSV (one row per filing/amendment,
+    with a clean 1:1 FILING_ID -> FILER_ID pair). Load it once into memory
+    so receipt/expenditure rows can resolve their actual filer.
+    """
+    target_filename = None
+    for f in the_zip.namelist():
+        name_lower = f.lower()
+        if "cvr_campaign_disclosure_cd" in name_lower:
+            target_filename = f
+            break
+
+    if not target_filename:
+        print("⚠️ Warning: CVR_CAMPAIGN_DISCLOSURE_CD.TSV was absent inside the archive — receipts/expenditures cannot be linked to a filer and will all be skipped.")
+        return {}
+
+    print(f"Loading FILING_ID -> FILER_ID map from {target_filename}...")
+    mapping = {}
+    with the_zip.open(target_filename) as raw_file:
+        text_file = io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore')
+        reader = csv.DictReader(_clean_tsv_lines(text_file), delimiter='\t')
+        for row in reader:
+            filing_id = row.get("FILING_ID", "").strip()
+            filer_id = row.get("FILER_ID", "").strip()
+            if filing_id and filer_id:
+                mapping[filing_id] = filer_id
+    print(f"  -> Loaded {len(mapping)} filing->filer mappings.")
+    return mapping
+
+def parse_receipt(row, filing_to_filer):
+    filer_id = filing_to_filer.get(row.get("FILING_ID", "").strip())
+    if not filer_id:
         return None
-    receipt_date = safe_date(row.get("RCVD_DATE") or row.get("DATE_RCVD"))
+    # Real column is RCPT_DATE — RCVD_DATE/DATE_RCVD never existed in this
+    # file. CTRIB_TYP doesn't exist either; ENTITY_CD (IND/COM/OTH/PTY/SCC)
+    # is the real column carrying the contributor's entity type. Contributor
+    # name columns are CTRIB_NAML/CTRIB_NAMF (no underscore before L/F).
+    receipt_date = safe_date(row.get("RCPT_DATE"))
     if not _is_recent(receipt_date):
         return None
-    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), receipt_date, row.get("CTRIB_TYP", "").strip(), row.get("CTRIB_NAM_L", "").strip(), row.get("CTRIB_NAM_F", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
+    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), receipt_date, row.get("ENTITY_CD", "").strip(), row.get("CTRIB_NAML", "").strip(), row.get("CTRIB_NAMF", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
 
-def parse_expenditure(row):
-    if not row.get("FILER_ID"):
+def parse_expenditure(row, filing_to_filer):
+    filer_id = filing_to_filer.get(row.get("FILING_ID", "").strip())
+    if not filer_id:
         return None
+    # Payee/candidate name columns are PAYEE_NAML/PAYEE_NAMF/CAND_NAML (no
+    # underscore before L/F) — same naming-convention mismatch as receipts.
     expenditure_date = safe_date(row.get("EXPN_DATE"))
     if not _is_recent(expenditure_date):
         return None
-    return (safe_int(row.get("FILING_ID")), row.get("FILER_ID", "").strip(), safe_float(row.get("AMOUNT")), expenditure_date, row.get("PAYEE_NAM_L", "").strip(), row.get("PAYEE_NAM_F", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAM_L", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
+    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), expenditure_date, row.get("PAYEE_NAML", "").strip(), row.get("PAYEE_NAMF", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAML", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
 
 def run_daily_sync():
     db_url = os.environ.get("SUPABASE_DB_URL")
@@ -248,11 +314,16 @@ def run_daily_sync():
                 conn
             )
 
+            # Receipts/expenditures don't carry FILER_ID directly — resolve
+            # it via each row's FILING_ID against the cover-sheet map loaded
+            # here (see load_filing_to_filer_map's docstring).
+            filing_to_filer = load_filing_to_filer_map(the_zip)
+
             # Load Receipts
             process_file_data(
                 the_zip,
                 "rcpt_cd",
-                parse_receipt,
+                lambda row: parse_receipt(row, filing_to_filer),
                 """INSERT INTO calaccess_receipts (filing_id, filer_id, amount, receipt_date, contributor_type,
                    contributor_last_name, contributor_first_name, contributor_city, contributor_state,
                    contributor_zip, contributor_employer, contributor_occupation, cumulative_ytd)
@@ -264,7 +335,7 @@ def run_daily_sync():
             process_file_data(
                 the_zip,
                 "expn_cd",
-                parse_expenditure,
+                lambda row: parse_expenditure(row, filing_to_filer),
                 """INSERT INTO calaccess_expenditures (filing_id, filer_id, amount, expenditure_date, payee_last_name,
                    payee_first_name, payee_city, payee_state, payee_zip, expenditure_code, expenditure_description,
                    candidate_name, ballot_measure_name, support_oppose_code)
