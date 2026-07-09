@@ -48,6 +48,15 @@ def _is_recent(iso_date_str):
     except ValueError:
         return False
 
+def safe_str(val):
+    """csv.DictReader fills a row's trailing columns with None (not "") when
+    a line has fewer tab-separated fields than the header — common in these
+    TSVs since trailing empty fields get truncated. row.get(X, "") only
+    substitutes the default when the key is absent, not when it's present
+    with a None value, so a bare row.get(X, "").strip() crashes with
+    AttributeError on those rows. This treats None and "" the same."""
+    return (val or "").strip()
+
 def safe_float(val):
     if not val or val.strip() == "":
         return 0.0
@@ -200,12 +209,12 @@ def parse_filer(row):
     # every previously-loaded filer had a blank filer_name, which made
     # search_filer's `ILIKE` lookup match nothing). Confirmed against the
     # real export's header, not assumed.
-    first = row.get("NAMF", "").strip()
-    last = row.get("NAML", "").strip()
+    first = safe_str(row.get("NAMF"))
+    last = safe_str(row.get("NAML"))
     full_name = f"{first} {last}".strip() if first else last
     if not row.get("FILER_ID"):
         return None
-    return (row.get("FILER_ID", "").strip(), row.get("FILER_TYPE", "").strip(), full_name, row.get("STATUS", "").strip(), first, last)
+    return (safe_str(row.get("FILER_ID")), safe_str(row.get("FILER_TYPE")), full_name, safe_str(row.get("STATUS")), first, last)
 
 def load_filing_to_filer_map(the_zip):
     """
@@ -238,15 +247,15 @@ def load_filing_to_filer_map(the_zip):
         text_file = io.TextIOWrapper(raw_file, encoding='utf-8', errors='ignore')
         reader = csv.DictReader(_clean_tsv_lines(text_file), delimiter='\t')
         for row in reader:
-            filing_id = row.get("FILING_ID", "").strip()
-            filer_id = row.get("FILER_ID", "").strip()
+            filing_id = safe_str(row.get("FILING_ID"))
+            filer_id = safe_str(row.get("FILER_ID"))
             if filing_id and filer_id:
                 mapping[filing_id] = filer_id
     print(f"  -> Loaded {len(mapping)} filing->filer mappings.")
     return mapping
 
 def parse_receipt(row, filing_to_filer):
-    filer_id = filing_to_filer.get(row.get("FILING_ID", "").strip())
+    filer_id = filing_to_filer.get(safe_str(row.get("FILING_ID")))
     if not filer_id:
         return None
     # Real column is RCPT_DATE — RCVD_DATE/DATE_RCVD never existed in this
@@ -256,10 +265,10 @@ def parse_receipt(row, filing_to_filer):
     receipt_date = safe_date(row.get("RCPT_DATE"))
     if not _is_recent(receipt_date):
         return None
-    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), receipt_date, row.get("ENTITY_CD", "").strip(), row.get("CTRIB_NAML", "").strip(), row.get("CTRIB_NAMF", "").strip(), row.get("CTRIB_CITY", "").strip(), row.get("CTRIB_ST", "").strip(), row.get("CTRIB_ZIP4", "").strip(), row.get("CTRIB_EMP", "").strip(), row.get("CTRIB_OCC", "").strip(), safe_float(row.get("CUM_YTD")))
+    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), receipt_date, safe_str(row.get("ENTITY_CD")), safe_str(row.get("CTRIB_NAML")), safe_str(row.get("CTRIB_NAMF")), safe_str(row.get("CTRIB_CITY")), safe_str(row.get("CTRIB_ST")), safe_str(row.get("CTRIB_ZIP4")), safe_str(row.get("CTRIB_EMP")), safe_str(row.get("CTRIB_OCC")), safe_float(row.get("CUM_YTD")))
 
 def parse_expenditure(row, filing_to_filer):
-    filer_id = filing_to_filer.get(row.get("FILING_ID", "").strip())
+    filer_id = filing_to_filer.get(safe_str(row.get("FILING_ID")))
     if not filer_id:
         return None
     # Payee/candidate name columns are PAYEE_NAML/PAYEE_NAMF/CAND_NAML (no
@@ -267,7 +276,7 @@ def parse_expenditure(row, filing_to_filer):
     expenditure_date = safe_date(row.get("EXPN_DATE"))
     if not _is_recent(expenditure_date):
         return None
-    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), expenditure_date, row.get("PAYEE_NAML", "").strip(), row.get("PAYEE_NAMF", "").strip(), row.get("PAYEE_CITY", "").strip(), row.get("PAYEE_ST", "").strip(), row.get("PAYEE_ZIP4", "").strip(), row.get("EXPN_CODE", "").strip(), row.get("EXPN_DSCR", "").strip(), row.get("CAND_NAML", "").strip(), row.get("BAL_NAME", "").strip(), row.get("SUP_OPP_CD", "").strip())
+    return (safe_int(row.get("FILING_ID")), filer_id, safe_float(row.get("AMOUNT")), expenditure_date, safe_str(row.get("PAYEE_NAML")), safe_str(row.get("PAYEE_NAMF")), safe_str(row.get("PAYEE_CITY")), safe_str(row.get("PAYEE_ST")), safe_str(row.get("PAYEE_ZIP4")), safe_str(row.get("EXPN_CODE")), safe_str(row.get("EXPN_DSCR")), safe_str(row.get("CAND_NAML")), safe_str(row.get("BAL_NAME")), safe_str(row.get("SUP_OPP_CD")))
 
 def run_daily_sync():
     db_url = os.environ.get("SUPABASE_DB_URL")
